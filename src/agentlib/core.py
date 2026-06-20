@@ -7,14 +7,7 @@ from typing import get_type_hints, Callable
 
 
 def _stringify_tool_output(out) -> str:
-    """Turn a tool's return value into a string for the model to read.
-    CHANGE: previously this was always str(out), which turns dicts/lists into
-    Python repr — e.g. {'city': 'NYC'} with single quotes, which is NOT valid
-    JSON. If a model (or your own code) tries to json.loads() that back, it
-    fails. Strings pass through untouched; everything else is JSON-encoded
-    when possible, falling back to str() only if it truly isn't serializable
-    (e.g. a custom object with no __dict__).
-    """
+    """Serializes tool return values into valid JSON strings for model consumption."""
     if isinstance(out, str):
         return out
     try:
@@ -44,10 +37,6 @@ class Conversation:
             msg["content"] = text
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        # BUG FIX: store the exact provider-native message (when available) so it
-        # can be replayed verbatim on the next request to that SAME provider,
-        # instead of re-deriving the wire format from the generic tool_calls
-        # shape (which doesn't match what Anthropic/Gemini actually expect back).
         if native is not None:
             msg["_native"] = native
             msg["_native_provider"] = native_provider
@@ -64,7 +53,7 @@ class Conversation:
         self.history.append(msg)
 
     def export_for(self, provider: str, special_format: Callable[[list], list] = None) -> list:
-        """Translates local flat memory frames into external API layouts."""
+        """Translates local flat memory frames into target external API layouts."""
         if special_format and callable(special_format):
             return special_format(self.history)
 
@@ -79,8 +68,6 @@ class Conversation:
             for msg in self.history:
                 if msg["role"] == "system": 
                     continue 
-                # BUG FIX: replay a stored native Gemini message verbatim instead
-                # of re-deriving it, so we don't have to guess/fabricate fields.
                 if msg.get("_native_provider") == "gemini" and "_native" in msg:
                     gemini_history.append(msg["_native"])
                     continue
@@ -102,34 +89,15 @@ class Conversation:
                 elif msg["role"] == "tool":
                     gemini_history.append({
                         "role": "tool",
-                        # BUG FIX: Gemini functionCall objects don't carry an id —
-                        # we used to fabricate "" here. Just omit it instead of
-                        # claiming a value that was never real.
                         "parts": [{"functionResponse": {"name": msg["name"], "response": {"result": msg["content"]}}}]
                     })
             return gemini_history
 
     def _export_anthropic(self) -> list:
-        """
-        BUG FIX (the big one): Anthropic requires (1) all tool_result blocks for
-        one assistant turn to live in a SINGLE user message, and (2) the
-        assistant message that called those tools to come back in Anthropic's
-        own content-block shape on the next request — not our generic
-        tool_calls format. Without this, a second tool round-trip in the same
-        conversation sends Anthropic an invalid payload.
-
-        We do this by replaying any message that was originally produced for
-        anthropic via its stored "_native" shape, and only falling back to the
-        old generic translation for messages that weren't (e.g. you built
-        history by hand).
-        """
+        """Structures conversation blocks to comply with Anthropic context constraints."""
         out = []
         pending_tool_results = []
-        emitted_native_ids = set()  # BUG FIX: a group of tool results shares ONE
-                                     # native dict across several history entries
-                                     # (one per tool call) — track by identity so
-                                     # we emit that shared dict only once, not once
-                                     # per history entry that points to it.
+        emitted_native_ids = set() 
 
         def flush():
             if pending_tool_results:
@@ -162,7 +130,6 @@ class Conversation:
             if msg["role"] == "user":
                 out.append({"role": "user", "content": msg["content"]})
             elif msg["role"] == "assistant":
-                # Fallback translation for assistant turns with no native shape stored.
                 content = []
                 if msg.get("content"):
                     content.append({"type": "text", "text": msg["content"]})
@@ -183,9 +150,7 @@ class ToolRegistry:
     """Introspective schema compiler mapping local Python logic to AI tools."""
     def __init__(self):
         self.functions_maps = {}
-        self.schemas = {}  # CHANGE: dict keyed by name instead of a list, so
-                            # re-registering a tool overwrites its schema
-                            # instead of appending a duplicate.
+        self.schemas = {} 
     
     def register(self, python_function, schema: dict = None):
         if schema is None:
@@ -224,7 +189,7 @@ class ToolRegistry:
             func_name = schema["name"]
 
         self.functions_maps[func_name] = python_function
-        self.schemas[func_name] = schema  # CHANGE: dict assignment instead of list.append
+        self.schemas[func_name] = schema 
     
     def execute(self, name: str, args: dict):
         if name in self.functions_maps:
@@ -235,7 +200,7 @@ class ToolRegistry:
         if not self.schemas:
             return []
 
-        schema_list = list(self.schemas.values())  # CHANGE: pull values out for export
+        schema_list = list(self.schemas.values()) 
 
         if special_format and callable(special_format):
             return special_format(schema_list)
@@ -255,19 +220,16 @@ class Agent:
         self.conversation = Conversation(system_instruction=system_instruction)
         self.tool_registry = ToolRegistry()
         self.switch_api(provider=provider, model=model, base_url=base_url, api_key=api_key)
-        self.set_max_tool_iterations(max_tool_iterations)  # ADD: see method below
+        self.set_max_tool_iterations(max_tool_iterations) 
 
     def set_max_tool_iterations(self, n: int):
-        """Change how many tool-call round trips a single chat() call will make
-        before giving up. Call this any time, e.g. agent.set_max_tool_iterations(20).
-        Defaults to 10 in __init__. Guards against a model/tool stuck looping forever.
-        """
+        """Sets the upper threshold for consecutive tool execution cycles."""
         if not isinstance(n, int) or n < 1:
             raise ValueError("max_tool_iterations must be an integer >= 1")
         self.max_tool_iterations = n
 
     def switch_api(self, provider: str, model: str, base_url: str = None, api_key: str = None):
-        """Re-routes active socket addresses and validation hashes seamlessly."""
+        """Re-routes active transport endpoints and authorization vectors seamlessly."""
         self.provider = provider.lower()
         self.model = model
         self.api_key = api_key
@@ -306,7 +268,7 @@ class Agent:
     def chat(self, user_input: str, custom_format_func: Callable[[list], list] = None) -> str:
         self.conversation.add_user_msg(user_input)
 
-        iterations = 0  # ADD: tracked alongside the existing while True loop
+        iterations = 0 
         while True:
             iterations += 1
             if iterations > self.max_tool_iterations:
@@ -334,9 +296,6 @@ class Agent:
                 text_parts = [p['text'] for p in parts if 'text' in p]
 
                 if function_calls:
-                    # BUG FIX: handle all functionCall parts in this turn (was only
-                    # ever looking at parts[0]), and store the native message so
-                    # it replays correctly on the next request.
                     tool_calls = [{"id": "", "function": {"name": fc['name'], "arguments": fc.get('args', {})}}
                                   for fc in function_calls]
                     self.conversation.add_model_msg(
@@ -348,7 +307,7 @@ class Agent:
                     for fc in function_calls:
                         name, args = fc['name'], fc.get('args', {})
                         out = self.tool_registry.execute(name, args)
-                        out_str = _stringify_tool_output(out)  # CHANGE: was str(out)
+                        out_str = _stringify_tool_output(out) 
                         self.conversation.history.append({
                             "role": "tool", "name": name, "content": out_str,
                             "_native": {"role": "tool", "parts": [{"functionResponse": {"name": name, "response": {"result": out_str}}}]},
@@ -375,23 +334,16 @@ class Agent:
                         t_calls.append({"id": block["id"], "function": {"name": block["name"], "arguments": block["input"]}})
                 
                 if t_calls:
-                    # BUG FIX: store the assistant turn in Anthropic's own content-block
-                    # shape (res["content"]) so it replays correctly, instead of only
-                    # the generic tool_calls format.
                     self.conversation.add_model_msg(
                         text=final_text if final_text else None,
                         tool_calls=t_calls,
                         native={"role": "assistant", "content": res.get("content", [])},
                         native_provider="anthropic"
                     )
-                    # BUG FIX: collect ALL tool results for this turn into ONE user
-                    # message (Anthropic requires this — was previously appending a
-                    # separate user message per tool call, which breaks role
-                    # alternation as soon as two tools are called in the same turn).
                     tool_result_blocks = []
                     for tc in t_calls:
                         out = self.tool_registry.execute(tc["function"]["name"], tc["function"]["arguments"])
-                        out_str = _stringify_tool_output(out)  # CHANGE: was str(out)
+                        out_str = _stringify_tool_output(out) 
                         tool_result_blocks.append({"type": "tool_result", "tool_use_id": tc["id"], "content": out_str})
                     native_user_msg = {"role": "user", "content": tool_result_blocks}
                     for tc, block in zip(t_calls, tool_result_blocks):
@@ -419,7 +371,7 @@ class Agent:
                         name = tool_call["function"]["name"]
                         args = json.loads(tool_call["function"]["arguments"]) if isinstance(tool_call["function"]["arguments"], str) else tool_call["function"]["arguments"]
                         out = self.tool_registry.execute(name, args)
-                        self.conversation.add_tool_response(name, _stringify_tool_output(out), tool_call["id"])  # CHANGE: was str(out)
+                        self.conversation.add_tool_response(name, _stringify_tool_output(out), tool_call["id"]) 
                     continue
                 text = msg.get("content", "")
                 self.conversation.add_model_msg(text=text)
@@ -438,7 +390,7 @@ class Agent:
                     for tool_call in msg["tool_calls"]:
                         name, args = tool_call["function"]["name"], tool_call["function"]["arguments"]
                         out = self.tool_registry.execute(name, args)
-                        self.conversation.add_tool_response(name, _stringify_tool_output(out))  # CHANGE: was str(out)
+                        self.conversation.add_tool_response(name, _stringify_tool_output(out)) 
                     continue
                 text = msg.get("content", "")
                 self.conversation.add_model_msg(text=text)
