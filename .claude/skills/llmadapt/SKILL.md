@@ -79,7 +79,9 @@ data = agent.chat_json("List the TODOs in utils/ as [{file, line, text}]")
 
 ## Setup / troubleshooting
 
-- Install: `pip install llmadapt` (or `pip install -e .` from a clone).
+- Install: `pip install "git+https://github.com/Shyam-Parikh-2025/llmadapt.git"`
+  (or `pip install -e .` from a clone). Check with `llmadapt --version` - it
+  should be 0.4.0 or later; PyPI's old 0.1.0 has no CLI.
 - Keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` (or
   `GOOGLE_API_KEY`), from the environment or a `.env` file in the project.
 - Defaults: `LLMADAPT_PROVIDER`, `LLMADAPT_<PROVIDER>_MODEL`, `OLLAMA_HOST`.
