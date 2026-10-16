@@ -197,6 +197,33 @@ assert "already_done" in result.code, "the architect's own implementation must s
 compile(result.code, "<t>", "exec")
 print("PASS 11: stub_and_fill assembles a compiling module from architect + implementers")
 
+from llmadapt import python_verifier  # noqa: E402
+
+
+def run_with_verifier(verify, summarize_body='    return f"{len(data)} keys"\n'):
+    company, architect, w1, w2 = build_stub_company()
+    architect.agent._send_request = FakeResponder([text_response(block(STUB_MODULE))])
+    w1.agent._send_request = FakeResponder([text_response(block(
+        'def load(path: str) -> dict:\n    """Load."""\n    with open(path) as fh:\n        return json.load(fh)\n'))])
+    w2.agent._send_request = FakeResponder([text_response(block(
+        'def summarize(data: dict) -> str:\n    """Summarize."""\n' + summarize_body))])
+    return stub_and_fill(company, "build a tiny json tool", verify=verify)
+
+
+passing = run_with_verifier(python_verifier("assert summarize({'a': 1}) == '1 keys'"))
+assert passing.ok and passing.verified and passing.verify_error is None, passing.verify_error
+# Compiles fine, but is wrong - exactly what compile() alone could never catch.
+wrong = run_with_verifier(python_verifier("assert summarize({'a': 1}) == '1 keys'"),
+                          summarize_body='    return f"{len(data) + 1} keys"\n')
+assert wrong.syntax_error is None and wrong.verified and not wrong.ok
+assert "AssertionError" in wrong.verify_error, wrong.verify_error
+assert wrong.to_dict()["verify_error"] == wrong.verify_error
+broken = run_with_verifier(lambda code: 1 / 0)
+assert not broken.ok and "ZeroDivisionError" in broken.verify_error
+unchecked = run_with_verifier(None)
+assert unchecked.ok and not unchecked.verified
+print("PASS 11b: verify= runs the assembled module + tests; a wrong body fails, a broken verifier is reported")
+
 # Implementers are assigned round-robin, and each one only sees the interface.
 implementer_payload = json.dumps(w1.agent._send_request.calls[0])
 assert "def load" in implementer_payload and "def summarize" in implementer_payload

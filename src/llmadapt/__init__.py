@@ -40,7 +40,7 @@ from .builder import (
 )
 from .help import company_help
 from .delegation import (
-    stub_and_fill, plan_then_execute, stub_and_fill_async, plan_then_execute_async,
+    stub_and_fill, plan_then_execute, stub_and_fill_async, plan_then_execute_async, python_verifier,
     extract_stubs, assemble_module,
     StubPlan, StubAndFillResult, PlanResult,
 )
@@ -127,6 +127,7 @@ __all__ = [
     "plan_then_execute",
     "stub_and_fill_async",
     "plan_then_execute_async",
+    "python_verifier",
     "extract_stubs",
     "assemble_module",
     "StubPlan",

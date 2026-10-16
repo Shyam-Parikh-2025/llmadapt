@@ -533,8 +533,18 @@ print(result.answer, [s.instruction for s in result.steps])
 ```
 
 Neither raises on a model-quality failure — an unfilled stub or a failed step
-comes back on the result object. Assembled code is checked with `compile()` for
-**syntax only**; nothing runs or tests it.
+comes back on the result object. By default assembled code is checked with
+`compile()` for **syntax only**. To actually run it, pass a verifier, which
+imports the module and runs your tests in a subprocess. Only do this where you
+would run model-written code yourself:
+
+```python
+from llmadapt import python_verifier
+
+result = company.run_structured("build a JSON toolkit", strategy="stub_fill",
+                                verify=python_verifier("assert merge({'a': 1}, {'b': 2}) == {'a': 1, 'b': 2}"))
+print(result.ok, result.verify_error)     # False plus the failing output if a test broke
+```
 
 **Log compaction.** `Company(log_compaction=LogCompactionPolicy(mode="algorithmic"))`
 collapses old activity and tool-call entries after each task, keeping counts
@@ -705,6 +715,8 @@ or use `gpt-5.4-mini` / `gpt-5-mini` when you need tools.
 - **12 new coding skills** (39 total), plus `skills=`, `personality=` and
   `tools=` on a plain `Agent`.
 - **Better tool schemas** from type hints and docstrings, and `chat_json()`.
+- **Verified stub-and-fill:** `verify=python_verifier(tests)` runs the
+  assembled code and its tests, not just `compile()`.
 - **CLI and MCP server** for use from terminals and AI coding assistants,
   including `llmadapt map` to fan one prompt out over many files.
 - **Cost control:** opt-in Anthropic prompt caching, `cost_estimate()`, a

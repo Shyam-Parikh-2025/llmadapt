@@ -22,11 +22,13 @@
 > - **Suite:** 27 files, 550+ checks, green on Python 3.9-3.13 (Linux);
 >   CI workflow added for Linux/macOS/Windows.
 >
-> Still open, in order of value: (1) verify generated code in
-> `delegation.stub_and_fill` by importing/testing it in a subprocess, with a
-> repair round; (2) OpenAI Responses API transport (GPT-6 models only support
-> tools there); (3) streaming, which unlocks mid-generation budget enforcement;
-> (4) budget governance v2.
+> - **Delegation:** `stub_and_fill(verify=python_verifier(tests))` runs the
+>   assembled module + tests in a subprocess (roadmap item #2, first half).
+>
+> Still open, in order of value: (1) a repair round when verification fails
+> (feed the failure back to the implementers); (2) OpenAI Responses API
+> transport (GPT-6 models only support tools there); (3) streaming, which
+> unlocks mid-generation budget enforcement; (4) budget governance v2.
 
 Companion to `company-roadmap.md`. The roadmap is the authoritative record of
 *what was built and why*, per phase. This document covers everything around
