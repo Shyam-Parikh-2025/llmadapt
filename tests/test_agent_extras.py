@@ -319,4 +319,59 @@ core._safe_print("[X] ➔ stage", file=stream)
 assert stream.getvalue().strip() == "[X] -> stage", stream.getvalue()
 print("PASS: status messages degrade to ASCII instead of crashing on a cp1252 pipe")
 
+
+# --- 12. Anthropic prompt caching marks the stable prefix, on copies ----------
+agent = quiet(model="claude-sonnet-5-5", system_instruction="S" * 50, prompt_cache=True)
+agent.add_tool(one)
+agent.add_tool(two)
+agent._send_request = FakeResponder([
+    {"content": [{"type": "tool_use", "id": "t1", "name": "one", "input": {"x": "1"}}],
+     "usage": {"input_tokens": 10, "cache_creation_input_tokens": 1000, "output_tokens": 5}},
+    {"content": [{"type": "text", "text": "done"}],
+     "usage": {"input_tokens": 12, "cache_read_input_tokens": 1000, "output_tokens": 7}},
+])
+agent.chat("go")
+first, second = agent._send_request.calls
+assert first["system"] == [{"type": "text", "text": "S" * 50, "cache_control": {"type": "ephemeral"}}]
+assert "cache_control" not in first["tools"][0] and first["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+assert first["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+assert second["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}  # tool_result block
+assert not any("cache_control" in json.dumps(m) for m in agent.conversation.history), "history must stay clean"
+assert agent.usage_log[0]["input"] == 1010 and agent.usage_log[0]["cache_write"] == 1000
+assert agent.usage_log[1]["cache_read"] == 1000 and agent.total_tokens_used == 1010 + 5 + 1012 + 7
+plain = quiet(model="m", system_instruction="S")
+plain._send_request = FakeResponder([{"content": [{"type": "text", "text": "x"}]}])
+plain.chat("go")
+assert plain._send_request.calls[0]["system"] == "S", "caching is opt-in"
+print("PASS: prompt_cache marks system/tools/last message, leaves history clean, counts cached tokens")
+
+
+# --- 13. cost_estimate prices usage from the catalog, honestly -----------------
+# 10 plain input + 1000 cache-write at $2/M*1.25, 5 out at $10/M; then 12 plain
+# + 1000 cache-read at $2/M*0.1, 7 out at $10/M.
+expected = (10 * 0.002 + 1000 * 0.002 * 1.25 + 5 * 0.010 + 12 * 0.002 + 1000 * 0.002 * 0.10 + 7 * 0.010) / 1000
+assert abs(agent.cost_estimate() - expected) < 1e-9, (agent.cost_estimate(), expected)
+assert plain.cost_estimate() is None, "unknown model -> None, not a confident zero"
+assert Agent(provider="ollama", verbose=False).cost_estimate() == 0.0
+print("PASS: cost_estimate uses catalog prices incl. cache multipliers; unknown -> None; local -> 0")
+
+
+# --- 14. running out of max_tokens before answering is an error, not "" ------
+agent = quiet()
+agent._send_request = FakeResponder([{"content": [{"type": "thinking", "thinking": "..."}],
+                                      "stop_reason": "max_tokens", "usage": {"output_tokens": 16000}}])
+try:
+    agent.chat("hard question")
+    assert False, "an empty, truncated reply must not be returned as the answer"
+except RuntimeError as e:
+    assert "max_tokens" in str(e)
+agent = quiet("openai")
+agent._send_request = FakeResponder([{"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}])
+try:
+    agent.chat("x")
+    assert False
+except RuntimeError as e:
+    assert "token limit" in str(e)
+print("PASS: a reply truncated before any answer raises with advice instead of returning ''")
+
 print("\nAll checks passed.")

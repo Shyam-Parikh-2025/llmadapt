@@ -123,6 +123,24 @@ try:
     assert {r["name"] for r in rows} >= {"fs", "fs-write", "code", "shell", "python", "web"}
     print("PASS: list shows skills and toolkits, as text or JSON")
 
+    for name in ("a.txt", "bb.txt", "ccc.txt"):
+        with open(os.path.join(tmp, name), "w") as f:
+            f.write(name * 10)
+    files = [os.path.join(tmp, n) for n in ("a.txt", "bb.txt", "ccc.txt")]
+    before = len(REQUESTS)
+    proc = run("map", "Summarize", *files, "--concurrency", "2", "--usage")
+    assert proc.returncode == 0, proc.stderr
+    blocks = proc.stdout.strip().split("\n\n")
+    assert [b.splitlines()[0] for b in blocks] == [f"### {p}" for p in files], proc.stdout
+    assert len(REQUESTS) - before == 3
+    assert "free (local)" in proc.stderr and "tokens used: 45" in proc.stderr, proc.stderr
+    proc = run("map", "Summarize", files[0], "--jsonl")
+    row = json.loads(proc.stdout)
+    assert row["file"] == files[0] and row["answer"].startswith("ANSWER(")
+    proc = run("map", "Summarize", files[0], os.path.join(tmp, "nope.txt"))
+    assert proc.returncode == 2 and "no such file" in proc.stderr
+    print("PASS: map runs one prompt per file concurrently, keeps input order, reports usage")
+
     proc = run("outline", os.path.join(tmp, "missing.py"))
     assert proc.returncode == 2 and "llmadapt outline:" in proc.stderr and "Traceback" not in proc.stderr
     proc = run("ask", "x", "--no-stdin", "--skills", "pyhton")

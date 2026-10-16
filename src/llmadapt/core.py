@@ -478,6 +478,32 @@ def extract_json(text: str) -> Any:
     raise ValueError(str(first_error))
 
 
+def _add_anthropic_cache_breakpoints(payload: dict) -> None:
+    """Mark the stable prefix of an Anthropic request as cacheable: the
+    system prompt, the tool list, and the conversation so far (the last
+    message). Later requests that share that prefix are billed at the cache
+    read rate - most of a tool loop, or a long chat, re-sends exactly that.
+
+    Works on copies: history/tool dicts may be shared with the stored
+    conversation, which must never carry provider bookkeeping."""
+    marker = {"type": "ephemeral"}
+    system = payload.get("system")
+    if isinstance(system, str) and system:
+        payload["system"] = [{"type": "text", "text": system, "cache_control": marker}]
+    tools = payload.get("tools")
+    if tools:
+        payload["tools"] = list(tools[:-1]) + [dict(tools[-1], cache_control=marker)]
+    messages = payload.get("messages") or []
+    if messages:
+        last = dict(messages[-1])
+        content = last.get("content")
+        if isinstance(content, str) and content:
+            last["content"] = [{"type": "text", "text": content, "cache_control": marker}]
+        elif isinstance(content, list) and content and isinstance(content[-1], dict):
+            last["content"] = list(content[:-1]) + [dict(content[-1], cache_control=marker)]
+        payload["messages"] = list(messages[:-1]) + [last]
+
+
 def _merge_extra(payload: dict, extra: Optional[dict]) -> dict:
     """Overlay `extra` onto a request body. Nested dicts merge one level
     deep, so extra_params={"options": {"temperature": 0}} on Ollama keeps
@@ -856,7 +882,8 @@ class Agent:
                  verbose: Optional[bool] = None,
                  request_timeout: Optional[float] = 600.0,
                  max_retries: int = 2,
-                 extra_params: Optional[dict] = None):
+                 extra_params: Optional[dict] = None,
+                 prompt_cache: bool = False):
         """
         Most callers need only `provider` (and `model`). The rest, briefly:
 
@@ -878,6 +905,11 @@ class Agent:
         extra_params: extra fields merged into every request body, for knobs
             this library does not model itself - e.g. {"temperature": 0.2},
             {"reasoning_effort": "low"} or Ollama {"options": {...}}.
+        prompt_cache: Anthropic only - mark the system prompt, tools and
+            conversation prefix as cacheable, so repeated requests (every step
+            of a tool loop, every turn of a chat) re-read them at ~10% of the
+            input price. The first write costs 25% extra, so it pays off from
+            the second request on. Other providers cache automatically.
         """
         self.archive = archive
         if skills or personality:
@@ -905,6 +937,7 @@ class Agent:
             raise ValueError("max_retries must be a non-negative integer")
         self.max_retries = max_retries
         self.extra_params = dict(extra_params or {})
+        self.prompt_cache = bool(prompt_cache)
         for tool_func in tools or ():
             self.add_tool(tool_func)
 
@@ -1045,7 +1078,16 @@ class Agent:
         try:
             if self.provider == "anthropic":
                 u = res.get("usage") or {}
-                return {"input": u.get("input_tokens", 0) or 0, "output": u.get("output_tokens", 0) or 0}
+                # With prompt caching, input_tokens counts only the uncached
+                # part; the cached prefix is reported separately. All of it was
+                # processed, so all of it counts toward budgets.
+                cache_write = u.get("cache_creation_input_tokens", 0) or 0
+                cache_read = u.get("cache_read_input_tokens", 0) or 0
+                out = {"input": (u.get("input_tokens", 0) or 0) + cache_write + cache_read,
+                       "output": u.get("output_tokens", 0) or 0}
+                if cache_write or cache_read:
+                    out.update({"cache_write": cache_write, "cache_read": cache_read})
+                return out
             if self.provider in ("openai", "custom"):
                 u = res.get("usage") or {}
                 return {"input": u.get("prompt_tokens", 0) or 0, "output": u.get("completion_tokens", 0) or 0}
@@ -1062,7 +1104,41 @@ class Agent:
         usage = self._extract_usage(res)
         turn_total = usage["input"] + usage["output"]
         self.total_tokens_used += turn_total
-        self.usage_log.append({"input": usage["input"], "output": usage["output"], "total": turn_total})
+        entry = {"input": usage["input"], "output": usage["output"], "total": turn_total}
+        for key in ("cache_write", "cache_read"):
+            if usage.get(key):
+                entry[key] = usage[key]
+        entry["model"] = self.model
+        self.usage_log.append(entry)
+
+    def cost_estimate(self, catalog: Optional[Any] = None) -> Optional[float]:
+        """Rough USD cost of everything in usage_log, from the per-1K prices
+        in an ApiModelCatalog (the built-in seed table by default).
+
+        Local providers cost 0.0. Returns None if any call used a model the
+        catalog has no price for - an honest "unknown" beats a confident zero.
+        Cached input is priced at 10% (reads) and 125% (writes) of the input
+        rate, Anthropic's standard multipliers. An estimate for "roughly what
+        did that cost", not a bill: prices drift (see policy.py).
+        """
+        if self.provider == "ollama" or self.is_local:
+            return 0.0
+        if catalog is None:
+            from .policy import ApiModelCatalog
+            catalog = ApiModelCatalog()
+        total = 0.0
+        for entry in self.usage_log:
+            spec = catalog.find(entry.get("model", self.model)) if hasattr(catalog, "find") else None
+            if spec is None:
+                return None
+            cache_write = entry.get("cache_write", 0)
+            cache_read = entry.get("cache_read", 0)
+            plain_input = max(0, entry["input"] - cache_write - cache_read)
+            total += (plain_input * spec.cost_per_1k_input
+                      + cache_write * spec.cost_per_1k_input * 1.25
+                      + cache_read * spec.cost_per_1k_input * 0.10
+                      + entry["output"] * spec.cost_per_1k_output) / 1000.0
+        return round(total, 6)
 
     def tool(self, python_function: Optional[Callable] = None, schema: dict = None):
         """Decorator to register a Python function as a tool.
@@ -1366,12 +1442,19 @@ class Agent:
             payload["generationConfig"] = {"maxOutputTokens": max_tokens}
         return payload
     
+    # Anthropic requires max_tokens on every request. Current models think
+    # before answering by default and thinking counts toward this cap, so the
+    # old 4096 could be spent entirely on thinking, leaving an empty answer.
+    ANTHROPIC_DEFAULT_MAX_TOKENS = 16000
+
     def gen_payload_anthropic(self, history, tools, headers, max_tokens: int):
-        if max_tokens is None: max_tokens = 4096
+        if max_tokens is None: max_tokens = self.ANTHROPIC_DEFAULT_MAX_TOKENS
         headers.update({"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
         payload = {"model": self.model, "messages": history, "max_tokens": max_tokens}
         if tools: payload["tools"] = tools
         if self.conversation.system_instruction: payload["system"] = self.conversation.system_instruction
+        if getattr(self, "prompt_cache", False):
+            _add_anthropic_cache_breakpoints(payload)
         return payload
 
     def gen_payload_openai_custom(self, history, tools, headers, max_tokens: int):
@@ -1586,6 +1669,11 @@ class Agent:
             self._update_stage("Tool results sent to AI", thinking_visible=thinking_visible)
             return None
         
+        if not final_text and res.get("stop_reason") == "max_tokens":
+            raise RuntimeError(
+                f"{self.model} used its whole max_tokens ({res.get('usage', {}).get('output_tokens', '?')} "
+                f"output tokens) before writing an answer - usually on thinking. Raise max_tokens "
+                f"(Agent(max_tokens=...) or chat(..., max_tokens=...)).")
         self.conversation.add_model_msg(text=final_text)
         self._update_stage("Success", thinking_visible=thinking_visible)
         return final_text
@@ -1625,6 +1713,10 @@ class Agent:
             return None
         
         text = msg.get("content", "")
+        if not text and res['choices'][0].get("finish_reason") == "length":
+            raise RuntimeError(
+                f"{self.model} hit its token limit before writing an answer (finish_reason=length) - "
+                f"raise max_tokens.")
         self.conversation.add_model_msg(text=text)
         self._update_stage("Success", thinking_visible=thinking_visible)
         return text    

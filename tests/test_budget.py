@@ -69,7 +69,7 @@ agent._send_request = FakeResponder([usage_response("hi there", 100, 50)])
 result = agent.chat("hello")
 assert result == "hi there"
 assert agent.total_tokens_used == 150
-assert agent.usage_log == [{"input": 100, "output": 50, "total": 150}]
+assert agent.usage_log == [{"input": 100, "output": 50, "total": 150, "model": "claude-x"}]
 print("PASS: a single chat() turn records real per-provider usage onto total_tokens_used/usage_log")
 
 # Test 2: usage accumulates across multiple turns, including tool-call round-trips

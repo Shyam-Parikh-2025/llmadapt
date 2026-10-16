@@ -92,13 +92,15 @@ assert agent.max_tool_iterations == 6, agent.max_tool_iterations
 print("PASS 5: max_tool_iterations defaults to 6")
 
 
-# ---- 6. Anthropic max_tokens: explicit overrides default; default is 4096 ----
+# ---- 6. Anthropic max_tokens: explicit overrides default; default is 16000 ----
+# (Raised from 4096: current Claude models think before answering and thinking
+# counts toward max_tokens, so 4096 could be spent before any answer appeared.)
 agent = Agent(provider="anthropic", api_key="k")
 responder = FakeResponder([{"content": [{"type": "text", "text": "hi"}]}])
 agent._send_request = responder
 agent.chat("hello")
-assert responder.calls[0]["max_tokens"] == 4096
-print("PASS 6a: anthropic max_tokens defaults to 4096 when unset")
+assert responder.calls[0]["max_tokens"] == Agent.ANTHROPIC_DEFAULT_MAX_TOKENS == 16000
+print("PASS 6a: anthropic max_tokens defaults to 16000 when unset")
 
 agent2 = Agent(provider="anthropic", api_key="k", max_tokens=100)
 responder2 = FakeResponder([{"content": [{"type": "text", "text": "hi"}]}])

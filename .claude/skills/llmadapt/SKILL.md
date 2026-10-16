@@ -28,10 +28,15 @@ llmadapt doctor                      # first: which providers/keys/models are av
 llmadapt ask "<complete instructions>" --file a.py --file b.py --skills python,testing
 git diff | llmadapt ask "Review this diff for bugs" --skills code-review
 llmadapt ask "Return the public functions as JSON: [{name, args}]" --file mod.py --json
+llmadapt map "Write a Google-style docstring for each public function" src/*.py --jsonl --usage
 ```
 
 - stdout is only the answer; status/errors go to stderr. Exit codes: 0 ok,
   1 provider/network failure, 2 usage error.
+- `map` runs one fresh agent per file (`-c` sets concurrency, default 4) and
+  prints results in input order; `--jsonl` gives `{"file", "answer"|"error"}`.
+- `--usage` prints tokens and an estimated cost to stderr - mention it to the
+  user when delegating to a paid API.
 - Provider is auto-picked (running Ollama first, then any API key found). Pin
   it with `--provider ollama|anthropic|openai|gemini` and `--model NAME`.
 - `--skills` takes built-in skill names; see `llmadapt list skills` (e.g.

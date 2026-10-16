@@ -2,6 +2,7 @@
 
     llmadapt doctor                       check keys, .env, Ollama and hardware
     llmadapt ask "question" [options]     one-shot answer from any provider
+    llmadapt map "prompt" FILE...         same prompt over many files, concurrently
     llmadapt chat [options]               interactive conversation
     llmadapt outline FILE...              classes/functions with line numbers
     llmadapt stub FILE                    a Python file without its bodies
@@ -237,9 +238,70 @@ def cmd_ask(args: argparse.Namespace) -> int:
             _err("Is Ollama running? Check with `llmadapt doctor`, or pick another --provider.")
         return 1
     if args.usage:
-        _err(f"[llmadapt] tokens used: {agent.total_tokens_used} "
-             f"(input {sum(u['input'] for u in agent.usage_log)}, output {sum(u['output'] for u in agent.usage_log)})")
+        _err(_usage_line([agent]))
     return 0
+
+
+def _usage_line(agents) -> str:
+    tokens_in = sum(u["input"] for a in agents for u in a.usage_log)
+    tokens_out = sum(u["output"] for a in agents for u in a.usage_log)
+    costs = [a.cost_estimate() for a in agents]
+    if any(c is None for c in costs):
+        cost = "cost unknown for this model"
+    else:
+        cost = f"~${sum(costs):.4f}" if sum(costs) else "free (local)"
+    return f"[llmadapt] tokens used: {tokens_in + tokens_out} (input {tokens_in}, output {tokens_out}); {cost}"
+
+
+def cmd_map(args: argparse.Namespace) -> int:
+    """Run the same prompt over many files concurrently - one fresh agent per
+    file, results printed in the order the files were given."""
+    import asyncio
+
+    provider, why = pick_provider(args.provider)
+    args.provider = provider  # resolve once, not once per file
+    if provider == "ollama":
+        args.model = _pick_ollama_model(args.model)
+    for path in args.files:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"no such file: {path}")
+    agents = []
+
+    async def run_all():
+        gate = asyncio.Semaphore(max(1, args.concurrency))
+
+        async def one(path):
+            async with gate:
+                agent = None
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    agent, _ = build_agent(args)
+                    agents.append(agent)
+                    answer = await agent.chat_async(f"{args.prompt}\n\n--- {path} ---\n{content}")
+                    return {"file": path, "answer": answer}
+                except Exception as e:  # noqa: BLE001 - one bad file must not sink the batch
+                    return {"file": path, "error": str(e).strip()}
+
+        return await asyncio.gather(*(one(p) for p in args.files))
+
+    if args.verbose:
+        _err(f"[llmadapt] map over {len(args.files)} file(s) with {provider} ({why}), "
+             f"{args.concurrency} at a time")
+    results = asyncio.run(run_all())
+    for result in results:
+        if args.jsonl:
+            _out(json.dumps(result, ensure_ascii=False))
+        elif "error" in result:
+            _out(f"### {result['file']}\nERROR: {result['error']}\n")
+        else:
+            _out(f"### {result['file']}\n{result['answer'].strip()}\n")
+    if args.usage:
+        _err(_usage_line(agents))
+    failed = sum(1 for r in results if "error" in r)
+    if failed:
+        _err(f"[llmadapt] {failed} of {len(results)} file(s) failed")
+    return 1 if failed else 0
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
@@ -352,10 +414,19 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("prompt", nargs="*", help="the question or instruction")
     p.add_argument("-f", "--file", action="append", help="include a file's contents as context (repeatable)")
     p.add_argument("--json", action="store_true", help="ask for JSON and print it parsed and pretty")
-    p.add_argument("--usage", action="store_true", help="print token usage to stderr")
+    p.add_argument("--usage", action="store_true", help="print token usage and estimated cost to stderr")
     p.add_argument("--no-stdin", action="store_true", help="do not read piped stdin")
     _add_agent_options(p)
     p.set_defaults(func=cmd_ask)
+
+    p = sub.add_parser("map", help="run one prompt over many files concurrently (one answer per file)")
+    p.add_argument("prompt", help="instruction applied to each file, e.g. 'Summarize this file in one line'")
+    p.add_argument("files", nargs="+", help="files to process")
+    p.add_argument("-c", "--concurrency", type=int, default=4, help="files in flight at once (default 4)")
+    p.add_argument("--jsonl", action="store_true", help='one JSON object per line: {"file", "answer"|"error"}')
+    p.add_argument("--usage", action="store_true", help="print total token usage/cost to stderr")
+    _add_agent_options(p)
+    p.set_defaults(func=cmd_map)
 
     p = sub.add_parser("chat", help="interactive conversation")
     _add_agent_options(p)

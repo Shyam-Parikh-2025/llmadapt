@@ -176,8 +176,11 @@ as to people:
   keeps the head and tail. None of these call an LLM.
 - **Delegate.** Hand self-contained work (first drafts of tests or docstrings,
   summaries, bulk edits, a second-opinion review) to a local or cheaper model
-  with `llmadapt ask ... --file x.py --skills testing`. stdout is only the
-  answer, and the exit code says whether it worked.
+  with `llmadapt ask ... --file x.py --skills testing`. To fan out,
+  `llmadapt map "Summarize this file in one line" src/*.py --jsonl` runs one
+  agent per file, several at a time. stdout is only the answer, `--usage`
+  reports tokens and estimated cost on stderr, and the exit code says whether
+  it worked.
 - **As MCP tools.** `llmadapt mcp` is a Model Context Protocol server
   exposing `ask_model`, `review_code`, `outline_code`, `compress_file` and
   `list_skills`:
@@ -203,9 +206,18 @@ agent = Agent(
     max_tokens=2000,              # cap on each reply
     extra_params={"temperature": 0.2},   # any extra request-body fields the provider accepts
     verbose=False,                # no status lines (or set LLMADAPT_VERBOSE=0)
+    prompt_cache=True,            # Anthropic: cache system prompt + tools + history prefix
 )
 agent.switch_api("ollama", model="qwen2.5-coder:7b")   # same conversation, different model
+
+agent.total_tokens_used          # real token counts reported by the provider
+agent.cost_estimate()            # rough USD from the built-in price table (None if unknown, 0.0 if local)
 ```
+
+`prompt_cache=True` matters most for agents with long system prompts (skills)
+or many tool rounds. Every request after the first re-reads the cached prefix
+at about a tenth of the normal input price. OpenAI and Gemini cache
+automatically.
 
 If the model keeps calling tools without ever answering, `chat()` raises a
 `RuntimeError` instead of looping forever.
@@ -693,7 +705,12 @@ or use `gpt-5.4-mini` / `gpt-5-mini` when you need tools.
 - **12 new coding skills** (39 total), plus `skills=`, `personality=` and
   `tools=` on a plain `Agent`.
 - **Better tool schemas** from type hints and docstrings, and `chat_json()`.
-- **CLI and MCP server** for use from terminals and AI coding assistants.
+- **CLI and MCP server** for use from terminals and AI coding assistants,
+  including `llmadapt map` to fan one prompt out over many files.
+- **Cost control:** opt-in Anthropic prompt caching, `cost_estimate()`, a
+  refreshed price table, and a larger Anthropic `max_tokens` default (16000),
+  because thinking counts toward it. A reply that runs out of tokens before
+  answering now raises an error instead of returning an empty string.
 - **Tests:** two suites that were broken on Windows are fixed, the full suite
   runs on Python 3.9-3.13, and CI covers Linux, macOS and Windows.
 

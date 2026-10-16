@@ -129,7 +129,9 @@ class LlmadaptMCPServer:
             answer = json.dumps(agent.chat_json(full_prompt), indent=2, ensure_ascii=False)
         else:
             answer = agent.chat(full_prompt)
-        return f"{answer}\n\n[llmadapt: {agent.provider}/{agent.model}, {agent.total_tokens_used} tokens]"
+        cost = agent.cost_estimate()
+        cost_note = "" if cost is None else (", free (local)" if cost == 0 else f", ~${cost:.4f}")
+        return f"{answer}\n\n[llmadapt: {agent.provider}/{agent.model}, {agent.total_tokens_used} tokens{cost_note}]"
 
     def tool_review_code(self, path: Optional[str] = None, diff: Optional[str] = None,
                          focus: str = "", provider: Optional[str] = None,
