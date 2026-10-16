@@ -857,8 +857,9 @@ class Agent:
         "ollama": "llama3.1:8b"
     }
 
-    # Transient HTTP statuses worth retrying: request timeout, conflict/lock,
-    # rate limit, the usual 5xx family, and Anthropic's 529 "overloaded".
+    # Transient HTTP statuses worth retrying - the same set the official
+    # Anthropic and OpenAI SDKs retry: request timeout, conflict/lock, rate
+    # limit, and every 5xx (including Anthropic's 529 "overloaded").
     RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 
     @classmethod
@@ -1327,7 +1328,7 @@ class Agent:
                 except Exception:
                     pass
                 last_error = RuntimeError(f"\n[{self.provider.upper()} HTTP Error {e.code}]: {body}")
-                if e.code not in self.RETRYABLE_STATUS:
+                if e.code not in self.RETRYABLE_STATUS and e.code < 500:
                     raise last_error
                 header = e.headers.get("Retry-After") if e.headers else None
                 try:
