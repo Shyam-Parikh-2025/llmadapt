@@ -494,10 +494,39 @@ def _merge_extra(payload: dict, extra: Optional[dict]) -> dict:
     return payload
 
 
-def _stdout_is_tty() -> bool:
+def ollama_base_url() -> str:
+    """Where Ollama listens: OLLAMA_HOST if set (the variable Ollama itself
+    reads - "host:port", "0.0.0.0", or a full URL), else localhost:11434."""
+    import os
+    host = (os.environ.get("OLLAMA_HOST") or "").strip().rstrip("/")
+    if not host:
+        return "http://localhost:11434"
+    if "://" not in host:
+        host = "http://" + host
+    scheme, rest = host.split("://", 1)
+    hostname, _, port = rest.partition(":")
+    if hostname in ("0.0.0.0", ""):
+        hostname = "localhost"  # a bind-all address is not something to connect to
+    return f"{scheme}://{hostname}:{port or '11434'}"
+
+
+def _safe_print(text: str, **kwargs: Any) -> None:
+    """print() that cannot crash a run over an encoding. On Windows, stdout
+    piped into another process (exactly how a coding agent or CI captures
+    output) is often cp1252, where '➔' and the spinner glyphs raise
+    UnicodeEncodeError - inside Agent.chat(), for a status message."""
+    try:
+        print(text, **kwargs)
+    except UnicodeEncodeError:
+        ascii_text = text.replace("➔", "->").encode("ascii", errors="replace").decode("ascii")
+        print(ascii_text, **kwargs)
+
+
+def _stdout_is_tty(stream: Any = None) -> bool:
     try:
         import sys
-        return bool(sys.stdout and sys.stdout.isatty())
+        stream = stream or sys.stdout
+        return bool(stream and stream.isatty())
     except Exception:
         return False
 
@@ -867,6 +896,10 @@ class Agent:
             flag = (env_value("LLMADAPT_VERBOSE") or "").strip().lower()
             verbose = flag not in ("0", "false", "no", "off")
         self.verbose = bool(verbose)
+        # Where stage messages and the spinner go. None means sys.stdout at
+        # print time; the CLI and MCP server point it at sys.stderr so stdout
+        # carries only the answer (or, for MCP, only the protocol).
+        self.status_stream = None
         self.request_timeout = request_timeout
         if not isinstance(max_retries, int) or max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer")
@@ -1058,9 +1091,11 @@ class Agent:
         self.thinking_stage = stage
         if not thinking_visible: return
         if detail:
-            print(f"[{self.provider.upper()}] ➔ {stage}: {detail}", end="\n", flush=True)
+            _safe_print(f"[{self.provider.upper()}] ➔ {stage}: {detail}", end="\n", flush=True,
+                        file=getattr(self, "status_stream", None))
         else:
-            print(f"[{self.provider.upper()}] ➔ {stage}...", end="\n", flush=True)
+            _safe_print(f"[{self.provider.upper()}] ➔ {stage}...", end="\n", flush=True,
+                        file=getattr(self, "status_stream", None))
 
     def pin_context(self, text: str, reason: str = "") -> dict:
         """Add a fact this agent must not lose to compaction. See
@@ -1139,7 +1174,7 @@ class Agent:
         elif self.provider == "anthropic":
             self.url = "https://api.anthropic.com/v1/messages"
         elif self.provider == "ollama":
-            self.url = "http://localhost:11434/api/chat"
+            self.url = ollama_base_url() + "/api/chat"
         else:
             self.url = ""
 
@@ -1679,12 +1714,13 @@ class Agent:
         try:
             while True:
                 if thinking_visible:
-                    print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="", flush=True)
+                    _safe_print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="",
+                                flush=True, file=getattr(self, "status_stream", None))
                     spinner_idx = (spinner_idx + 1) % len(spinner_frames)
                 await asyncio.sleep(0.08)  # Relinquishes control cleanly to event loop
         except asyncio.CancelledError:
             # Clear spinner line cleanly when the network task completes
-            print("\r" + " " * 50 + "\r", end="", flush=True)
+            _safe_print("\r" + " " * 50 + "\r", end="", flush=True, file=getattr(self, "status_stream", None))
 
     async def chat_async(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
                  thinking_visible: Optional[bool] = None, spinner: bool = True) -> str:
@@ -1708,7 +1744,7 @@ class Agent:
             thinking_visible = getattr(self, "verbose", True)
         # A spinner redraws one line with "\r"; in a log file, a pipe, or the
         # captured output of a coding agent's shell that is just noise.
-        spinner = bool(spinner and thinking_visible and _stdout_is_tty())
+        spinner = bool(spinner and thinking_visible and _stdout_is_tty(getattr(self, "status_stream", None)))
         # Off the loop: in mode="agent" this makes a full summarizer round-trip,
         # and doing that inline would stall every other coroutine sharing the loop
         # for the length of an LLM call.

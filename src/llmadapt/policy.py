@@ -206,35 +206,46 @@ class ApiModelSpec:
 # the provider's standard environment variable (see Agent.change_api), never
 # from a table checked into a repo.
 DEFAULT_API_CATALOG: Tuple[ApiModelSpec, ...] = (
+    # Prices are the providers' published standard rates as of October 2026
+    # (USD per 1K tokens = per-1M price / 1000). Capability is a coarse
+    # hand-assigned ranking, not a benchmark score.
     ApiModelSpec(
-        name="claude-3-5-sonnet-20241022", provider="anthropic",
-        cost_per_1k_input=0.003, cost_per_1k_output=0.015, capability=0.90,
-        specialties=("reasoning", "code", "writing", "long_context"),
-        context_window=200000, note="seed default - verify pricing before relying on it",
+        name="claude-opus-5-5", provider="anthropic",
+        cost_per_1k_input=0.004, cost_per_1k_output=0.020, capability=0.97,
+        specialties=("reasoning", "code", "writing", "long_context", "vision"),
+        context_window=1000000, note="seed default (Oct 2026 pricing) - verify before relying on it",
     ),
     ApiModelSpec(
-        name="claude-3-5-haiku-20241022", provider="anthropic",
-        cost_per_1k_input=0.0008, cost_per_1k_output=0.004, capability=0.65,
-        specialties=("code", "writing"),
-        context_window=200000, note="seed default - verify pricing before relying on it",
+        name="claude-sonnet-5-5", provider="anthropic",
+        cost_per_1k_input=0.002, cost_per_1k_output=0.010, capability=0.92,
+        specialties=("reasoning", "code", "writing", "long_context", "vision"),
+        context_window=1000000, note="seed default (Oct 2026 pricing) - verify before relying on it",
     ),
     ApiModelSpec(
-        name="gpt-4o", provider="openai",
-        cost_per_1k_input=0.0025, cost_per_1k_output=0.010, capability=0.88,
-        specialties=("reasoning", "code", "vision"),
-        context_window=128000, note="seed default - verify pricing before relying on it",
+        name="claude-haiku-5-5", provider="anthropic",
+        cost_per_1k_input=0.0001, cost_per_1k_output=0.0005, capability=0.72,
+        specialties=("code", "writing", "long_context"),
+        context_window=1000000,
+        note="seed default (Oct 2026 pricing; prompts over 100K tokens cost 5x) - verify before relying on it",
     ),
     ApiModelSpec(
-        name="gpt-4o-mini", provider="openai",
-        cost_per_1k_input=0.00015, cost_per_1k_output=0.0006, capability=0.55,
-        specialties=("code", "writing"),
-        context_window=128000, note="seed default - verify pricing before relying on it",
+        name="gpt-5.4-mini", provider="openai",
+        cost_per_1k_input=0.00075, cost_per_1k_output=0.0045, capability=0.74,
+        specialties=("code", "writing", "reasoning"),
+        context_window=400000, note="seed default (Oct 2026 pricing) - verify before relying on it",
     ),
     ApiModelSpec(
-        name="gemini-3.5-flash", provider="gemini",
-        cost_per_1k_input=0.0003, cost_per_1k_output=0.0025, capability=0.70,
+        name="gemini-3.6-flash", provider="gemini",
+        cost_per_1k_input=0.00075, cost_per_1k_output=0.00375, capability=0.78,
         specialties=("reasoning", "vision", "long_context", "writing"),
-        context_window=1000000, note="seed default - verify pricing before relying on it",
+        context_window=1000000,
+        note="seed default (Oct 2026 pricing; Google doubles it on 2027-01-01) - verify before relying on it",
+    ),
+    ApiModelSpec(
+        name="gemini-3.5-flash-lite", provider="gemini",
+        cost_per_1k_input=0.0003, cost_per_1k_output=0.0025, capability=0.60,
+        specialties=("writing", "long_context"),
+        context_window=1000000, note="seed default (Oct 2026 pricing) - verify before relying on it",
     ),
 )
 

@@ -4,30 +4,45 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmadapt"
-version = "0.3.1"
-description = "A lightweight, provider-agnostic LLM agent with tool-calling, context compression, rank-based routing, and hardware-aware local model support for Anthropic, OpenAI, Gemini, and Ollama."
+dynamic = ["version"]
+description = "A zero-dependency, provider-agnostic LLM agent toolkit: tool-calling agents, ready-made skills and toolkits, multi-agent companies, a CLI and an MCP server - for Anthropic, OpenAI, Gemini and Ollama."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
     { name = "Shyam Parikh", email = "shyamparikh@yahoo.com" }
 ]
-keywords = ["llm", "agent", "tool-calling", "anthropic", "openai", "gemini", "ollama", "context-compression", "local-llm"]
+keywords = ["llm", "agent", "tool-calling", "anthropic", "claude", "openai", "gemini", "ollama", "mcp",
+            "multi-agent", "context-compression", "local-llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
 ]
 dependencies = []
+
+[project.scripts]
+llmadapt = "llmadapt.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Shyam-Parikh-2025/llmadapt"
 Issues = "https://github.com/Shyam-Parikh-2025/llmadapt/issues"
 
+[tool.setuptools.dynamic]
+version = { attr = "llmadapt.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+llmadapt = ["py.typed"]

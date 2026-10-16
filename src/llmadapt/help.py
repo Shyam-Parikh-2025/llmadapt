@@ -243,7 +243,7 @@ _EXAMPLES: List[Dict[str, str]] = [
             "\n"
             "company = Company(\n"
             "    name='Acme',\n"
-            "    model_map={RoleRank.C_SUITE: {'provider': 'anthropic', 'model': 'claude-x'},\n"
+            "    model_map={RoleRank.C_SUITE: {'provider': 'anthropic', 'model': 'claude-sonnet-5-5'},\n"
             "               RoleRank.JUNIOR: {'provider': 'ollama', 'model': 'llama3.1:8b'}},\n"
             "    on_escalation=on_escalation,\n"
             "    total_token_budget=500_000,\n"

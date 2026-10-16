@@ -115,7 +115,7 @@ class ModelRouter:
                 # Estimate 5GB for standard 8B local models as a reference check
                 is_safe, warning = cls.check_hardware_safety(selected_model, 5.0, quota)
                 if not is_safe and policy.get("auto_fallback", True):
-                    fallback = model_map.get("fallback", "gemini-2.5-flash")
+                    fallback = model_map.get("fallback", "gemini-3.6-flash")
                     print(f"[Router Warning]: {warning} Falling back to '{fallback}'.")
                     return fallback
             return selected_model
@@ -126,9 +126,9 @@ class ModelRouter:
         if cost_priority == "high" and rank in [RoleRank.JUNIOR, RoleRank.INTERN]:
             return model_map.get("local_default", "ollama/llama3.1:8b")
         elif rank in [RoleRank.C_SUITE, RoleRank.MANAGER]:
-            return model_map.get("frontier_default", "claude-3-5-sonnet-20241022")
+            return model_map.get("frontier_default", "claude-sonnet-5-5")
 
-        return model_map.get("fast_default", "gemini-2.5-flash")
+        return model_map.get("fast_default", "gemini-3.6-flash")
 
     @classmethod
     def allocate_local_auto(
