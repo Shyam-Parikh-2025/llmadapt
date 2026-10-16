@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ dynamic = ["version"]
 description = "A zero-dependency, provider-agnostic LLM agent toolkit: tool-calling agents, ready-made skills and toolkits, multi-agent companies, a CLI and an MCP server - for Anthropic, OpenAI, Gemini and Ollama."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Shyam Parikh", email = "shyamparikh@yahoo.com" }
 ]
@@ -17,7 +18,6 @@ keywords = ["llm", "agent", "tool-calling", "anthropic", "claude", "openai", "ge
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",

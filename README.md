@@ -1,18 +1,24 @@
 # llmadapt
 
-A small, provider-agnostic agent for chatting with LLMs and giving them
-tools. Works with Anthropic, OpenAI, Gemini, and Ollama using only the
-Python standard library for HTTP — no `requests`, no provider SDKs.
+[![tests](https://github.com/Shyam-Parikh-2025/llmadapt/actions/workflows/tests.yml/badge.svg)](https://github.com/Shyam-Parikh-2025/llmadapt/actions/workflows/tests.yml)
 
-v0.3.0
+A small, provider-agnostic toolkit for building with LLMs. One `Agent` talks to
+**Anthropic, OpenAI, Gemini and Ollama** (plus any OpenAI-compatible endpoint),
+calls your Python functions as tools, and comes with ready-made skills,
+toolkits, a multi-agent "company" layer, a command-line tool and an MCP server.
+
+**Zero dependencies** - everything, HTTP included, is the Python standard
+library. Python 3.9+. Windows, macOS and Linux.
+
+Version 0.4.0 - see [what's new](#whats-new-in-040).
 
 ## Install
 
 ```bash
-pip install llmadapt
+pip install "git+https://github.com/Shyam-Parikh-2025/llmadapt.git"
 ```
 
-From source:
+or from a clone, editable:
 
 ```bash
 git clone https://github.com/Shyam-Parikh-2025/llmadapt.git
@@ -20,50 +26,189 @@ cd llmadapt
 pip install -e .
 ```
 
+(PyPI currently has an old 0.1.0 under this name; `pip install llmadapt` will
+get 0.4.0 once it is published there.)
+
+Then check what is set up:
+
+```bash
+llmadapt doctor
+```
+
+It reports which API keys it can see (never their values), whether Ollama is
+running and which models it has, your hardware, and which provider `llmadapt
+ask` would use.
+
+## Configure a provider
+
+Pick at least one:
+
+| provider    | how to enable it                                                     | default model       |
+|-------------|----------------------------------------------------------------------|---------------------|
+| `anthropic` | set `ANTHROPIC_API_KEY`                                              | `claude-sonnet-5-5` |
+| `openai`    | set `OPENAI_API_KEY`                                                 | `gpt-5.4-mini`      |
+| `gemini`    | set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)                           | `gemini-3.6-flash`  |
+| `ollama`    | install [Ollama](https://ollama.com), then `ollama pull llama3.1:8b` | `llama3.1:8b`       |
+| `custom`    | any OpenAI-compatible server: `Agent("openai", base_url=..., key_alias=...)` | -          |
+
+Keys can live in your environment or in a `.env` file in your project (found
+automatically, up to six folders up; the real environment always wins). Other
+settings, all optional:
+
+| variable | effect |
+|---|---|
+| `LLMADAPT_<PROVIDER>_MODEL` | change a provider's default model, e.g. `LLMADAPT_ANTHROPIC_MODEL=claude-haiku-5-5` |
+| `LLMADAPT_PROVIDER` | which provider the CLI uses when you don't say |
+| `LLMADAPT_VERBOSE=0` | turn off the step-by-step status lines |
+| `OLLAMA_HOST` | where Ollama runs, if not `localhost:11434` |
+
+Model names change often. Passing `model=` explicitly is always the most
+reliable choice; the defaults above are a convenience.
+
 ## Quick start
 
 ```python
 from llmadapt import Agent
 
-agent = Agent(
-    provider="anthropic",
-    model="claude-sonnet-4-6",
-    api_key="sk-ant-...",  # or set ANTHROPIC_API_KEY in your environment
-    system_instruction="You are a helpful assistant.",
-)
-
+agent = Agent("anthropic")                  # or "openai", "gemini", "ollama"
 print(agent.chat("What's 12 * 7?"))
+print(agent.chat("Now divide that by 4."))  # the conversation carries over
 ```
 
-## Giving the agent tools
+From a terminal:
+
+```bash
+llmadapt ask "Explain Python's GIL in two sentences"
+git diff | llmadapt ask "Review this diff" --skills code-review
+llmadapt chat --provider ollama
+```
+
+More in [`examples/`](examples/): a quick start, a code assistant over a
+folder, structured JSON output, and a multi-agent team.
+
+## Tools: your own functions
 
 ```python
-def get_weather(city: str) -> dict:
-    """Look up the current weather for a city."""
-    return {"city": city, "tempF": 72, "condition": "sunny"}
+from typing import Literal
 
-agent.add_tool(get_weather)
+def get_weather(city: str, unit: Literal["F", "C"] = "F") -> dict:
+    """Look up the current weather for a city.
+
+    Args:
+        city: City name, e.g. "Paris".
+        unit: Temperature unit.
+    """
+    return {"city": city, "temp": 72, "unit": unit}
+
+agent.add_tool(get_weather)          # or decorate it with @agent.tool
 print(agent.chat("What's the weather in NYC?"))
 ```
 
-A JSON schema is auto-generated from the function's type hints, default
-values, and docstring. Tool outputs are JSON-serialized automatically
-(plain strings pass through untouched).
+The JSON schema the model sees is generated from the function: the docstring
+becomes the description, type hints become JSON types (`str`, `int`, `float`,
+`bool`, `list[...]`, `dict`, `Optional[...]`, `Literal[...]` and `Enum` are
+understood), and an `Args:` section (or `:param x:` lines) describes each
+parameter. Return values are JSON-serialized for the model; plain strings pass
+through. If a tool raises, the model sees the error and can try again instead
+of the run crashing. Tools can be `async def`, and several tool calls in one
+turn run concurrently.
 
-## Switching providers
+## Ready-made toolkits
+
+Common tools, already written, safe by default:
 
 ```python
-agent.switch_api(provider="openai", model="gpt-4o", api_key="sk-...")
+from llmadapt import Agent, toolkit
+
+agent = Agent("ollama", tools=toolkit("fs", "code", root="./my_project"))
+print(agent.chat("Which modules make network calls?"))
 ```
 
-## Limiting tool-call loops
+| toolkit | tools | notes |
+|---|---|---|
+| `fs` | `read_file`, `list_files`, `search_files` | read-only; confined to `root` (symlinks included) |
+| `fs-write` | `fs` + `write_file`, `edit_file` | opt-in; `edit_file` needs a unique exact match |
+| `code` | `outline_file`, `stub_file` | a file's classes and functions without the bodies |
+| `shell` | `run_command` | one program per call, from an allowlist; runs in `root` |
+| `python` | `run_python` | runs a snippet in a fresh interpreter |
+| `web` | `fetch_url` | http(s) only, HTML reduced to text |
+
+`shell` and `python` run real processes on your machine. Their allowlist stops
+mistakes, not a determined model, so only give them to a model you would let
+type in your terminal. The individual factories (`filesystem_tools(root,
+allow_write=True)`, `shell_tools(root, allowed_commands=[...])`, ...) take
+more options.
+
+## Skills and personalities
+
+Skills are reusable instructions with hard constraints: 39 built in, including
+`python`, `testing`, `code-review`, `debugging`, `security-review`, `sql`,
+`agentic-coding`, `test-driven-development` and `technical-docs`. Personalities
+set tone, for example `concise`, `mentor`, `skeptical` or `socratic`.
 
 ```python
-agent.set_max_tool_iterations(20)  # default is 10
+agent = Agent("openai", skills=["python", "testing"], personality="concise")
 ```
 
-If the model gets stuck calling tools repeatedly without producing a final
-answer, `chat()` raises a `RuntimeError` instead of looping forever.
+`llmadapt list skills` (or `llmadapt.SKILLS.names()`) shows them all. Typos
+are caught (`unknown skill 'pyhton' (did you mean 'python'?)`), and you can
+register your own (see [Presets](#multi-agent-companies) below).
+
+## Structured output
+
+```python
+bugs = agent.chat_json("Find the bugs in: def avg(xs): return sum(xs)/len(xs)-1",
+                       schema_hint=[{"line": "int", "problem": "str"}])
+```
+
+This returns parsed JSON (a dict or list). Code fences and chatter around the
+JSON are tolerated. If the reply doesn't parse, the model is shown the error
+and asked once more. It works with every provider.
+
+## Using llmadapt from an AI coding assistant
+
+llmadapt is useful to assistants like Claude Code, Cursor or Copilot as well
+as to people:
+
+- **Read less.** `llmadapt outline big_file.py` lists every class and function
+  with line numbers. `llmadapt stub file.py` shows signatures without bodies.
+  `pytest 2>&1 | llmadapt compress --max-chars 4000` folds repeated lines and
+  keeps the head and tail. None of these call an LLM.
+- **Delegate.** Hand self-contained work (first drafts of tests or docstrings,
+  summaries, bulk edits, a second-opinion review) to a local or cheaper model
+  with `llmadapt ask ... --file x.py --skills testing`. stdout is only the
+  answer, and the exit code says whether it worked.
+- **As MCP tools.** `llmadapt mcp` is a Model Context Protocol server
+  exposing `ask_model`, `review_code`, `outline_code`, `compress_file` and
+  `list_skills`:
+
+  ```bash
+  claude mcp add llmadapt -- llmadapt mcp --provider ollama --root .
+  ```
+
+  Any other MCP client works with `{"command": "llmadapt", "args": ["mcp", "--provider", "ollama", "--root", "."]}`.
+- **As a skill.** [`.claude/skills/llmadapt/SKILL.md`](.claude/skills/llmadapt/SKILL.md)
+  teaches an assistant when and how to use all of the above. Claude Code
+  picks it up inside this repo; copy it to `~/.claude/skills/llmadapt/` to
+  have it everywhere.
+
+## Reliability and control
+
+```python
+agent = Agent(
+    "anthropic",
+    request_timeout=120,          # seconds per HTTP request (default 600; None = wait forever)
+    max_retries=3,                # retries 429/5xx/529/dropped connections, honouring Retry-After
+    max_tool_iterations=10,       # tool-calling rounds before giving up (default 6)
+    max_tokens=2000,              # cap on each reply
+    extra_params={"temperature": 0.2},   # any extra request-body fields the provider accepts
+    verbose=False,                # no status lines (or set LLMADAPT_VERBOSE=0)
+)
+agent.switch_api("ollama", model="qwen2.5-coder:7b")   # same conversation, different model
+```
+
+If the model keeps calling tools without ever answering, `chat()` raises a
+`RuntimeError` instead of looping forever.
 
 ## Compressing tool output
 
@@ -118,7 +263,7 @@ uses the same no-external-tokenizer heuristic as `CompressionPolicy`
 an exact provider count:
 
 ```python
-agent = Agent(provider="anthropic", model="claude-3-5-sonnet-20241022",
+agent = Agent(provider="anthropic", model="claude-sonnet-5-5",
                max_context_tokens=100_000)
 
 agent.chat("Summarize this document...")
@@ -146,7 +291,7 @@ from llmadapt import Agent, ModelRouter, RoleRank
 model = ModelRouter.allocate_model(
     rank=RoleRank.JUNIOR,
     policy={"cost_priority": "high"},
-    model_map={"local_default": "ollama/llama3.1:8b", "frontier_default": "claude-sonnet-4-6"},
+    model_map={"local_default": "ollama/llama3.1:8b", "frontier_default": "claude-sonnet-5-5"},
 )
 compression = ModelRouter.allocate_compression_policy(RoleRank.JUNIOR)
 
@@ -219,7 +364,7 @@ three explicitly — plus anything `build_from_template()` accepts, e.g.
 ```python
 company = quick_company(
     "small-coding-team", name="Acme", size="medium",
-    model_map={"C_SUITE": {"provider": "anthropic", "model": "claude-3-5-sonnet-20241022"}},
+    model_map={"C_SUITE": {"provider": "anthropic", "model": "claude-sonnet-5-5"}},
     total_token_budget=200_000,
 )
 ```
@@ -238,7 +383,7 @@ def on_escalation(event):
 company = Company(
     name="Acme",
     model_map={
-        role.C_SUITE: {"provider": "anthropic", "model": "claude-3-5-sonnet-20241022"},
+        role.C_SUITE: {"provider": "anthropic", "model": "claude-sonnet-5-5"},
         role.JUNIOR:  {"provider": "ollama",    "model": "llama3.1:8b"},
     },
     on_escalation=on_escalation,
@@ -320,9 +465,9 @@ from llmadapt.router import role
 from llmadapt.company import mode
 
 policy = ModelPolicy(api_catalog=ApiModelCatalog([
-    ApiModelSpec(name="gpt-4o-mini", provider="openai",
-                 cost_per_1k_input=0.00015, cost_per_1k_output=0.0006,
-                 capability=0.55, specialties=("code",)),
+    ApiModelSpec(name="gpt-5.4-mini", provider="openai",
+                 cost_per_1k_input=0.00075, cost_per_1k_output=0.0045,
+                 capability=0.74, specialties=("code",)),
 ], include_defaults=False))
 
 company = Company(..., model_policy=policy)
@@ -341,7 +486,7 @@ string — nothing new was needed there.
 
 **Presets.** Skills, personalities, org templates and org-chart palettes all
 come from one registry, so they work the same way and can all be extended.
-The built-in catalog ships 27 skills, 22 personalities, 20 palettes and 20 org
+The built-in catalog ships 39 skills, 22 personalities, 20 palettes and 20 org
 templates — enough that picking one is usually faster than writing one:
 
 ```python
@@ -517,27 +662,60 @@ waiting and then saying no is still saying no.
 
 ## Supported providers
 
-| provider    | env var for API key   | notes                          |
-|-------------|------------------------|--------------------------------|
-| `anthropic` | `ANTHROPIC_API_KEY`    | Messages API                   |
-| `openai`    | `OPENAI_API_KEY`       | Chat Completions API           |
-| `gemini`    | `GEMINI_API_KEY`       | generateContent endpoint       |
-| `ollama`    | *(none — local)*       | defaults to `localhost:11434`  |
-| `custom`    | *(none — pass directly)* | requires `base_url` + a `custom_format_func` you supply to `chat()` |
+| provider    | env var for API key                     | notes                          |
+|-------------|------------------------------------------|--------------------------------|
+| `anthropic` | `ANTHROPIC_API_KEY`                      | Messages API                   |
+| `openai`    | `OPENAI_API_KEY`                         | Chat Completions API           |
+| `gemini`    | `GEMINI_API_KEY` or `GOOGLE_API_KEY`     | generateContent endpoint       |
+| `ollama`    | *(none - local)*                         | `OLLAMA_HOST`, default `localhost:11434` |
+| `custom`    | *(none - pass directly)*                 | requires `base_url` + a `custom_format_func` you supply to `chat()` |
+
+OpenAI-compatible services (OpenRouter, Groq, Together, vLLM, LM Studio, ...)
+work as `provider="openai"` with a `base_url`. Give each one its own key with
+`key_alias="openrouter"` (which reads `OPENROUTER_API_KEY`) or
+`key_env="MY_VAR"`.
+
+Some newer OpenAI models (the GPT-6 family) only support tool calling through
+the Responses API, which llmadapt does not speak yet. Use them for plain chat,
+or use `gpt-5.4-mini` / `gpt-5-mini` when you need tools.
+
+## What's new in 0.4.0
+
+- **Ready to use:** `llmadapt doctor`, current default models (overridable
+  with environment variables), `GOOGLE_API_KEY` and `OLLAMA_HOST` support, and
+  `switch_api()`, which this README had always documented but which didn't
+  exist until now.
+- **Sturdier:** HTTP timeouts and automatic retries for rate limits and
+  overloads. Status output can't crash a run on a Windows pipe, the spinner
+  only shows on a real terminal, and Anthropic thinking blocks survive a model
+  switch.
+- **Ready-made toolkits:** `fs`, `fs-write`, `code`, `shell`, `python`, `web`.
+- **12 new coding skills** (39 total), plus `skills=`, `personality=` and
+  `tools=` on a plain `Agent`.
+- **Better tool schemas** from type hints and docstrings, and `chat_json()`.
+- **CLI and MCP server** for use from terminals and AI coding assistants.
+- **Tests:** two suites that were broken on Windows are fixed, the full suite
+  runs on Python 3.9-3.13, and CI covers Linux, macOS and Windows.
 
 ## Running tests
 
 ```bash
-PYTHONPATH=src python3 tests/run_all.py     # the whole suite
-PYTHONPATH=src python3 tests/test_agent.py  # or one file
+python tests/run_all.py          # the whole suite (sets PYTHONPATH=src itself)
+PYTHONPATH=src python tests/test_agent.py   # or one file
 ```
 
-Tests run entirely offline against scripted fake HTTP responses — no API key
-or network access required. Plain `assert` + `print`, no test framework.
+Tests run entirely offline against scripted fake responses, with no API key
+or network needed. They use plain `assert` + `print`, with no test framework.
 
-`tests/browser_smoke.py` is deliberately outside the suite: it drives the
-Phase 8 GUI through a real headless browser and needs `playwright`, which
-llmadapt does not depend on. Run it by hand after changing `gui_assets.py`.
+`tests/browser_smoke.py` is deliberately outside the suite. It drives the
+GUI through a real headless browser and needs `playwright`, which llmadapt
+does not depend on. Run it by hand after changing `gui_assets.py`.
+
+## Contributing
+
+See [CLAUDE.md](CLAUDE.md) for the conventions (zero dependencies, test style,
+Python 3.9 floor). The design history of the multi-agent layer is in
+[`docs/dev/company-roadmap.md`](docs/dev/company-roadmap.md).
 
 ## License
 
