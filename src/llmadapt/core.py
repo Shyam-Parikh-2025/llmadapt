@@ -151,8 +151,14 @@ class Conversation:
             msg["tool_call_id"] = tool_call_id
         self._append(msg)
 
-    def export_for(self, provider: str, special_format: Callable[[list], list] = None) -> list:
-        """Translates local flat memory frames into target external API layouts."""
+    def export_for(self, provider: str, special_format: Callable[[list], list] = None,
+                   model: Optional[str] = None) -> list:
+        """Translates local flat memory frames into target external API layouts.
+
+        `model` is the model the request is about to go to. Only Anthropic
+        uses it: thinking blocks are tied to the model that produced them, so
+        replaying them to a different model (after switch_api) is rejected -
+        they are dropped from that model's view instead."""
         if special_format and callable(special_format):
             return special_format(self.history)
 
@@ -183,7 +189,7 @@ class Conversation:
             return cleaned_history
             
         elif provider == "anthropic":
-            return self._export_anthropic()
+            return self._export_anthropic(model=model)
             
         elif provider == "gemini":    
             return self._export_gemini()
@@ -202,7 +208,7 @@ class Conversation:
     def change_model_role(self, new_role: str):
         self.model_role = new_role
 
-    def _export_anthropic(self) -> list:
+    def _export_anthropic(self, model: Optional[str] = None) -> list:
         """Structures conversation blocks to comply with Anthropic context constraints."""
         out = []
         pending_tool_results = []
@@ -223,7 +229,13 @@ class Conversation:
                     continue
                 emitted_native_ids.add(native_hash)
                 flush()
-                out.append(msg["_native"])
+                native = msg["_native"]
+                produced_by = msg.get("_native_model")
+                if model and produced_by and produced_by != model and isinstance(native.get("content"), list):
+                    kept = [b for b in native["content"]
+                            if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))]
+                    native = dict(native, content=kept)
+                out.append(native)
                 continue
 
             if msg["role"] == "tool":
@@ -429,6 +441,155 @@ class RunPaused(ToolControlFlow):
         super().__init__(f"run paused awaiting a decision on: {getattr(event, 'message', event)!r}")
 
 
+def extract_json(text: str) -> Any:
+    """Parse the JSON value out of a model reply.
+
+    Tolerates the usual wrapping - a ```json fence, a sentence before or
+    after - by trying, in order: the whole text, the first fenced block, then
+    the first '{' or '[' decoded with raw_decode. Raises ValueError (with the
+    JSON error message) if none of them parse.
+    """
+    import re
+
+    if text is None:
+        raise ValueError("empty reply")
+    candidate = text.strip()
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        first_error = e
+    fence = re.search(r"```(?:json|JSON)?\s*\n?(.*?)```", candidate, re.DOTALL)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    decoder = json.JSONDecoder()
+    # Earliest opener first, so "[{...}, {...}]" comes back as the list rather
+    # than as its first element.
+    for start, char in enumerate(candidate):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(candidate[start:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    raise ValueError(str(first_error))
+
+
+def _merge_extra(payload: dict, extra: Optional[dict]) -> dict:
+    """Overlay `extra` onto a request body. Nested dicts merge one level
+    deep, so extra_params={"options": {"temperature": 0}} on Ollama keeps
+    the num_predict this library already put in "options"."""
+    if not extra:
+        return payload
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(payload.get(key), dict):
+            merged = dict(payload[key])
+            merged.update(value)
+            payload[key] = merged
+        else:
+            payload[key] = value
+    return payload
+
+
+def _stdout_is_tty() -> bool:
+    try:
+        import sys
+        return bool(sys.stdout and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+_PRIMITIVE_JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+
+def _json_schema_for(annotation: Any) -> dict:
+    """A JSON-schema fragment for one parameter's type hint.
+
+    Deliberately forgiving: anything it does not recognise becomes
+    {"type": "string"}, which is what every parameter used to be. A tool
+    whose hints are exotic still registers; it just gets a looser schema.
+    """
+    import enum
+    import typing
+
+    if annotation in _PRIMITIVE_JSON_TYPES:
+        return {"type": _PRIMITIVE_JSON_TYPES[annotation]}
+    if annotation in (list, tuple, set, frozenset):
+        return {"type": "array"}
+    if annotation is dict:
+        return {"type": "object"}
+    if isinstance(annotation, type) and issubclass(annotation, enum.Enum):
+        values = [m.value for m in annotation]
+        out = _json_schema_for(type(values[0])) if values else {"type": "string"}
+        out["enum"] = values
+        return out
+
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin is typing.Union or type(annotation).__name__ == "UnionType":
+        non_none = [a for a in args if a is not type(None)]
+        # Optional[X] is just X to the model - whether it may be omitted is
+        # what "required" says, and that comes from the default value.
+        return _json_schema_for(non_none[0]) if len(non_none) == 1 else {"type": "string"}
+    if origin is typing.Literal:
+        values = list(args)
+        out = _json_schema_for(type(values[0])) if values else {"type": "string"}
+        out["enum"] = values
+        return out
+    if origin in (list, tuple, set, frozenset) or (
+        origin is not None and getattr(origin, "__name__", "") in ("Sequence", "Iterable", "Collection")
+    ):
+        out = {"type": "array"}
+        item_args = [a for a in args if a is not Ellipsis]
+        if len(set(item_args)) == 1:
+            out["items"] = _json_schema_for(item_args[0])
+        return out
+    if origin is dict or (origin is not None and getattr(origin, "__name__", "") == "Mapping"):
+        return {"type": "object"}
+    return {"type": "string"}
+
+
+def _param_docs_from_docstring(doc: str) -> dict:
+    """Per-parameter descriptions from a docstring's `Args:` section
+    (Google style) or `:param name:` lines (Sphinx style). Returns {} when
+    the docstring has neither - the caller keeps its generic fallback."""
+    import re
+
+    docs: dict = {}
+    for match in re.finditer(r"^\s*:param\s+(?:[\w\[\], .]+\s+)?(\w+)\s*:\s*(.+)$", doc, re.MULTILINE):
+        docs[match.group(1)] = match.group(2).strip()
+    if docs:
+        return docs
+
+    lines = doc.splitlines()
+    in_args = False
+    current = None
+    args_indent = None
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^(Args|Arguments|Parameters|Params)\s*:\s*$", stripped):
+            in_args, current, args_indent = True, None, None
+            continue
+        if not in_args:
+            continue
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip())
+        if re.match(r"^[A-Z][A-Za-z ]*:\s*$", stripped) and (args_indent is None or indent < args_indent):
+            break  # next section, e.g. "Returns:"
+        entry = re.match(r"^(\w+)\s*(?:\([^)]*\))?\s*:\s*(.*)$", stripped)
+        if entry and (args_indent is None or indent <= args_indent):
+            args_indent = indent if args_indent is None else args_indent
+            current = entry.group(1)
+            docs[current] = entry.group(2).strip()
+        elif current is not None:
+            docs[current] = (docs[current] + " " + stripped).strip()
+    return docs
+
+
 class ToolRegistry:
     """ Tool Registry Class:
     This class needs to handle tool storage and usage.
@@ -441,29 +602,43 @@ class ToolRegistry:
         self.schemas = {} 
     
     def register(self, python_function, schema: dict = None):
+        """Register a callable as a tool.
+
+        With no `schema`, one is generated from the function itself:
+
+        - the docstring becomes the tool description;
+        - each parameter's JSON type comes from its type hint - `str`, `int`,
+          `float`, `bool`, `list[...]`/`tuple`/`set`, `dict`, `Optional[X]`,
+          `Literal[...]` and `Enum` subclasses are understood; anything else
+          is sent as a string;
+        - a parameter's description is taken from a Google-style `Args:`
+          section or Sphinx `:param name:` lines when the docstring has one;
+        - parameters without a default are required.
+        """
         if schema is None:
             func_name = python_function.__name__
             func_doc = inspect.getdoc(python_function) or "No description available."
-            type_mapping = {
-                str: "string", int: "integer", float: "number", bool: "boolean"
-            }
 
-            type_hints = get_type_hints(python_function)
+            try:
+                type_hints = get_type_hints(python_function)
+            except Exception:
+                # Unresolvable forward references should cost precision in the
+                # schema, never the ability to register the tool at all.
+                type_hints = {}
             signature = inspect.signature(python_function)
+            param_docs = _param_docs_from_docstring(func_doc)
             properties = {}
             required_params = []
 
             for param_name, param in signature.parameters.items():
-                param_type = type_hints.get(param_name, str)
-                gemini_type = type_mapping.get(param_type, "string")
-
-                properties[param_name] = {
-                    "type": gemini_type,
-                    "description": f"The {param_name} parameter"
-                }
+                if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                    continue  # *args/**kwargs have no meaningful JSON-schema shape
+                prop = _json_schema_for(type_hints.get(param_name, str))
+                prop["description"] = param_docs.get(param_name) or f"The {param_name} parameter"
+                properties[param_name] = prop
                 if param.default == inspect.Parameter.empty:
                     required_params.append(param_name)
-            
+
             schema = {
                 "name": func_name,
                 "description": func_doc,
@@ -500,7 +675,25 @@ class ToolRegistry:
 
         if not isinstance(args, dict):
             return None, f"Error: Arguments for tool '{name}' must be passed as a dictionary."
-        return args, None
+        return self._coerce_enums(name, args), None
+
+    def _coerce_enums(self, name: str, args: dict) -> dict:
+        """A model can only send an Enum parameter's *value* (the schema
+        lists values); turn it back into the member the function declared."""
+        import enum
+        try:
+            hints = get_type_hints(self.functions_maps[name])
+        except Exception:
+            return args
+        out = dict(args)
+        for key, value in args.items():
+            hint = hints.get(key)
+            if isinstance(hint, type) and issubclass(hint, enum.Enum) and not isinstance(value, hint):
+                try:
+                    out[key] = hint(value)
+                except ValueError:
+                    pass  # leave it; the tool's own error is more specific
+        return out
 
     @staticmethod
     def _failure_text(e: BaseException) -> str:
@@ -597,12 +790,29 @@ class Agent:
     Add tool and send request to AI model functions are needed.
     An overall Chat function that handles sending the payload to the AI model and handles the response. """
     
+    # Used only when no model= is given. These go stale as providers retire
+    # models (the previous table pointed at claude-3-5-sonnet-20241022 and
+    # gpt-4o-mini, both retired or deprecated by late 2026), so each one can
+    # be overridden without a code change via LLMADAPT_<PROVIDER>_MODEL, e.g.
+    # LLMADAPT_ANTHROPIC_MODEL=claude-haiku-5-5. Passing model= always wins.
     DEFAULT_MODELS = {
-        "gemini": "gemini-3.5-flash",
-        "anthropic": "claude-3-5-sonnet-20241022",
-        "openai": "gpt-4o-mini",
+        "gemini": "gemini-3.6-flash",
+        "anthropic": "claude-sonnet-5-5",
+        "openai": "gpt-5.4-mini",
         "ollama": "llama3.1:8b"
     }
+
+    # Transient HTTP statuses worth retrying: request timeout, conflict/lock,
+    # rate limit, the usual 5xx family, and Anthropic's 529 "overloaded".
+    RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+
+    @classmethod
+    def default_model_for(cls, provider: str) -> str:
+        """The model used when none is passed: `LLMADAPT_<PROVIDER>_MODEL`
+        from the environment (or a .env file) if set, else DEFAULT_MODELS."""
+        from .env import env_value
+        override = env_value(f"LLMADAPT_{provider.upper()}_MODEL")
+        return override or cls.DEFAULT_MODELS.get(provider, "custom-model")
 
     def __init__(self, provider: str, model: Optional[str] = None, base_url: Optional[str] = None,
                  api_key: Optional[str] = None, is_local: bool = False, system_instruction: str = "",
@@ -611,8 +821,40 @@ class Agent:
                  history_compaction: Optional[HistoryCompactionPolicy] = None,
                  archive: Optional[Any] = None,
                  key_alias: Optional[str] = None, key_env: Optional[str] = None,
-                 max_context_tokens: Optional[int] = None):
+                 max_context_tokens: Optional[int] = None,
+                 skills: Optional[list] = None, personality: Optional[Any] = None,
+                 tools: Optional[list] = None,
+                 verbose: Optional[bool] = None,
+                 request_timeout: Optional[float] = 600.0,
+                 max_retries: int = 2,
+                 extra_params: Optional[dict] = None):
+        """
+        Most callers need only `provider` (and `model`). The rest, briefly:
+
+        skills / personality: names from the built-in preset catalog
+            (`llmadapt.SKILLS.names()`, `llmadapt.PERSONALITIES.names()`) or
+            Skill/Personality objects. They are composed into the system
+            instruction, after `system_instruction`, exactly as
+            `Company.hire()` does it.
+        tools: callables (or a toolkit list from `llmadapt.toolkits`) to
+            register straight away - same as calling `add_tool` on each.
+        verbose: print stage messages and a spinner while working. None
+            (default) reads LLMADAPT_VERBOSE from the environment and falls
+            back to True; the spinner is only ever drawn on a real terminal.
+        request_timeout: seconds before an HTTP request is abandoned (None
+            waits forever, which is what every request did before).
+        max_retries: extra attempts for transient failures - 429, 5xx,
+            Anthropic's 529, dropped connections - with exponential backoff
+            that honours a Retry-After header.
+        extra_params: extra fields merged into every request body, for knobs
+            this library does not model itself - e.g. {"temperature": 0.2},
+            {"reasoning_effort": "low"} or Ollama {"options": {...}}.
+        """
         self.archive = archive
+        if skills or personality:
+            from .presets import compose_system_instruction
+            system_instruction = compose_system_instruction(
+                base=system_instruction, personality=personality, skills=skills or ())
         self.conversation = Conversation(system_instruction=system_instruction, archive=archive)
         self.tool_registry = ToolRegistry()
         self.change_api(provider=provider, model=model, base_url=base_url, api_key=api_key,
@@ -620,6 +862,18 @@ class Agent:
         self.set_max_tool_iterations(max_tool_iterations)
         self.max_tokens = max_tokens
         self.thinking_stage = "initial state"
+        if verbose is None:
+            from .env import env_value
+            flag = (env_value("LLMADAPT_VERBOSE") or "").strip().lower()
+            verbose = flag not in ("0", "false", "no", "off")
+        self.verbose = bool(verbose)
+        self.request_timeout = request_timeout
+        if not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError("max_retries must be a non-negative integer")
+        self.max_retries = max_retries
+        self.extra_params = dict(extra_params or {})
+        for tool_func in tools or ():
+            self.add_tool(tool_func)
 
         # A separate concept from max_tokens (the per-request *output* cap
         # sent to the provider): this is a whole-conversation budget tracked
@@ -777,8 +1031,20 @@ class Agent:
         self.total_tokens_used += turn_total
         self.usage_log.append({"input": usage["input"], "output": usage["output"], "total": turn_total})
 
-    def tool(self, python_function: Callable, schema: dict = None):
-        """Decorator to register a Python function as a tool with optional schema."""
+    def tool(self, python_function: Optional[Callable] = None, schema: dict = None):
+        """Decorator to register a Python function as a tool.
+
+        All three spellings work:
+
+            @agent.tool
+            def f(x: str): ...
+
+            @agent.tool()
+            def g(x: str): ...
+
+            @agent.tool(schema={...})
+            def h(x: str): ...
+        """
         if python_function is None:
             def decorator(func):
                 self.add_tool(func, schema)
@@ -859,7 +1125,7 @@ class Agent:
         transport, and OPENAI_API_KEY is the wrong key for every one of them.
         """
         self.provider = provider.lower()
-        self.model = model or self.DEFAULT_MODELS.get(self.provider, "custom-model")
+        self.model = model or self.default_model_for(self.provider)
         self.api_key = api_key
         self.key_alias = key_alias
         self.key_env = key_env
@@ -896,27 +1162,80 @@ class Agent:
                 logger.warning("Agent(provider=%r, model=%r): no API key - %s",
                                 self.provider, self.model, self.api_key_source)
 
+    def switch_api(self, provider: str, model: Optional[str] = None, base_url: Optional[str] = None,
+                   api_key: Optional[str] = None,
+                   key_alias: Optional[str] = None, key_env: Optional[str] = None) -> "Agent":
+        """Alias of change_api() (the name the README has always used), and
+        chainable. The conversation and the registered tools carry over."""
+        self.change_api(provider=provider, model=model, base_url=base_url, api_key=api_key,
+                        key_alias=key_alias, key_env=key_env)
+        return self
+
     def add_tool(self, python_function: Callable, schema: dict = None):
         self.tool_registry.register(python_function, schema)
 
+    def add_tools(self, functions) -> "Agent":
+        """Register several tools at once - e.g. a toolkit from
+        `llmadapt.toolkits` such as `filesystem_tools(".")`. Chainable."""
+        for func in functions:
+            self.add_tool(func)
+        return self
+
     def _send_request(self, payload: dict, headers: dict) -> dict:
-        """Executes native standard library post requests using zero external code."""
+        """POSTs one request with the standard library and returns the decoded
+        JSON body.
+
+        Transient failures (RETRYABLE_STATUS, dropped connections, timeouts)
+        are retried up to `max_retries` times with exponential backoff -
+        1s, 2s, 4s... capped at 30s, or the server's Retry-After when it sends
+        one. Anything else (401, 400, ...) fails immediately: retrying a bad
+        key or a malformed request only delays the same error.
+        """
         if not self.url:
             raise ValueError(f"API endpoint URL is not configured for provider '{self.provider}'. "
                              f"Please supply a valid base_url when calling change_api().")
 
         data_bytes = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(self.url, data=data_bytes, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"\n[{self.provider.upper()} HTTP Error {e.code}]: {e.read().decode('utf-8')}")
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"\n[Network Unreachable]: Check route {self.url}. Reason: {e.reason}")
+        attempts = getattr(self, "max_retries", 0) + 1
+        timeout = getattr(self, "request_timeout", None)
+        last_error: Optional[Exception] = None
+        for attempt in range(attempts):
+            req = urllib.request.Request(self.url, data=data_bytes, headers=headers, method="POST")
+            retry_after: Optional[float] = None
+            try:
+                if timeout is None:
+                    response_cm = urllib.request.urlopen(req)
+                else:
+                    response_cm = urllib.request.urlopen(req, timeout=timeout)
+                with response_cm as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                last_error = RuntimeError(f"\n[{self.provider.upper()} HTTP Error {e.code}]: {body}")
+                if e.code not in self.RETRYABLE_STATUS:
+                    raise last_error
+                header = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    retry_after = float(header) if header else None
+                except ValueError:
+                    retry_after = None
+            except urllib.error.URLError as e:
+                last_error = RuntimeError(f"\n[Network Unreachable]: Check route {self.url}. Reason: {e.reason}")
+            except (TimeoutError, ConnectionError, OSError) as e:
+                last_error = RuntimeError(f"\n[Network Error]: {self.url}: {e.__class__.__name__}: {e}")
+            if attempt + 1 < attempts:
+                delay = retry_after if retry_after is not None else min(30.0, 2.0 ** attempt)
+                logger.warning("%s request failed (%s); retrying in %.1fs (attempt %d of %d)",
+                               self.provider, str(last_error).strip()[:200], delay, attempt + 2, attempts)
+                time.sleep(delay)
+        raise last_error  # type: ignore[misc]
 
     def chat(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
-             thinking_visible: bool = True, spinner: bool = True) -> str:
+             thinking_visible: Optional[bool] = None, spinner: bool = True) -> str:
         """The synchronous entry point, unchanged for every caller that isn't
         writing async code: hand it a string, get a string back, no event loop
         required anywhere in sight.
@@ -936,8 +1255,44 @@ class Agent:
             what="Agent.chat()",
         )
 
+    def chat_json(self, user_input: str, schema_hint: Optional[Any] = None, retries: int = 1,
+                  **chat_kwargs: Any) -> Any:
+        """Ask for a JSON answer and get it back parsed (dict, list, ...).
+
+        `schema_hint` - a JSON-schema dict, an example object, or plain prose -
+        is appended to the request so the model knows the shape you want.
+        If the reply does not parse, the model is shown the parse error and
+        asked again, up to `retries` more times; after that a ValueError is
+        raised carrying the last raw reply. Works with every provider because
+        it relies only on instructions and tolerant parsing (code fences and
+        leading chatter are stripped), not on a provider-specific JSON mode.
+        """
+        return run_coroutine_blocking(
+            lambda: self.chat_json_async(user_input, schema_hint=schema_hint, retries=retries, **chat_kwargs),
+            what="Agent.chat_json()",
+        )
+
+    async def chat_json_async(self, user_input: str, schema_hint: Optional[Any] = None, retries: int = 1,
+                              **chat_kwargs: Any) -> Any:
+        """The awaitable form of chat_json()."""
+        instruction = "Respond with only a single valid JSON value - no prose, no code fences."
+        if schema_hint is not None:
+            hint = schema_hint if isinstance(schema_hint, str) else json.dumps(schema_hint, indent=2)
+            instruction += f"\nThe JSON must match this shape:\n{hint}"
+        reply = await self.chat_async(f"{user_input}\n\n{instruction}", **chat_kwargs)
+        for attempt in range(retries + 1):
+            try:
+                return extract_json(reply)
+            except ValueError as e:
+                if attempt >= retries:
+                    raise ValueError(f"model did not return valid JSON after {retries + 1} attempt(s): {e}. "
+                                     f"Last reply: {reply[:500]!r}") from None
+                reply = await self.chat_async(
+                    f"That reply was not valid JSON ({e}). Reply again with only the JSON value.",
+                    **chat_kwargs)
+
     def generate(self, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
-                 thinking_visible: bool = True, spinner: bool = True) -> str:
+                 thinking_visible: Optional[bool] = None, spinner: bool = True) -> str:
         """Generate a response from the current conversation and tools.
 
         Synchronous wrapper over generate_async() - see chat() for why this
@@ -964,7 +1319,7 @@ class Agent:
 
         else:
             raise ValueError(f"Unsupported provider: {self.provider}. Please review how to configure custom providers.")
-        return payload
+        return _merge_extra(payload, getattr(self, "extra_params", None))
 
     def gen_payload_gemini(self, history, tools, headers, max_tokens: int):
         if self.api_key: headers["x-goog-api-key"] = self.api_key
@@ -1004,33 +1359,20 @@ class Agent:
         return payload
     
     # Helper method for processing completed responses
-    def _run_tool_calls(self, calls, thinking_visible=False) -> list:
-        """Runs one turn's tool calls and returns their finished output
-        strings, positionally aligned with `calls`.
+    async def _run_tool_calls(self, calls, thinking_visible=False) -> list:
+        """Runs a turn's tool calls concurrently and returns their outputs in
+        call order.
 
         `calls` is the provider-neutral shape every process_*_response method
         normalizes to before dispatching: a list of
         {"id": str|None, "name": str, "args": dict|str}. Each provider parses
         its own response into that shape and writes the results back in its
         own format; what happens in between - invoke, compress, keep the
-        stages narrated - is identical for all four, and this is now the only
+        stages narrated - is identical for all four, and this is the only
         place it is written.
 
-        It used to be written four times, once inside each process_*_response
-        method. That is the same duplication REVIEW_MODES had before it was
-        collapsed (see company/team.py), and it was about to get worse rather
-        than better: parallel tool execution and resumable escalations both
-        need to change exactly this step, and changing it in four places twice
-        over is how the four copies start disagreeing.
-
-        Deliberately sequential, exactly as before - this refactor is a
-        no-behaviour-change move, and turning the loop into an
-        `asyncio.gather` is the next phase's job, not this one's. It is a
-        separate method precisely so that becomes a one-place change.
-        """
-    async def _run_tool_calls(self, calls, thinking_visible=False) -> list:
-        """Runs a turn's tool calls concurrently and returns their outputs in
-        call order.
+        Because the calls run concurrently, the order in which the tools
+        *start* is not guaranteed - only the order of the returned results is.
 
         This is the line that makes a delegation hierarchy worth having. A
         manager splitting work three ways emits three tool calls in one turn;
@@ -1191,6 +1533,7 @@ class Agent:
                 text=final_text if final_text else None, tool_calls=t_calls,
                 native={"role": "assistant", "content": res.get("content", [])}, native_provider="anthropic"
             )
+            self.conversation.history[-1]["_native_model"] = self.model
             calls = [{"id": tc["id"], "name": tc["function"]["name"], "args": tc["function"]["arguments"]}
                      for tc in t_calls]
             outputs = await self._run_tool_calls(calls, thinking_visible=thinking_visible)
@@ -1344,7 +1687,7 @@ class Agent:
             print("\r" + " " * 50 + "\r", end="", flush=True)
 
     async def chat_async(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
-                 thinking_visible: bool = True, spinner: bool = True) -> str:
+                 thinking_visible: Optional[bool] = None, spinner: bool = True) -> str:
             # Resuming a paused run re-enters this agent through exactly the
             # call that paused it, carrying the same task text. The turn it was
             # in the middle of is still recorded, so this is a continuation, not
@@ -1358,9 +1701,14 @@ class Agent:
     
     async def generate_async(
         self, custom_format_func: Callable[[list], list] = None, 
-        max_tokens: int = None, thinking_visible: bool = True, 
+        max_tokens: int = None, thinking_visible: Optional[bool] = None,
         spinner: bool = True) -> str:
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        if thinking_visible is None:
+            thinking_visible = getattr(self, "verbose", True)
+        # A spinner redraws one line with "\r"; in a log file, a pipe, or the
+        # captured output of a coding agent's shell that is just noise.
+        spinner = bool(spinner and thinking_visible and _stdout_is_tty())
         # Off the loop: in mode="agent" this makes a full summarizer round-trip,
         # and doing that inline would stall every other coroutine sharing the loop
         # for the length of an LLM call.
@@ -1385,7 +1733,8 @@ class Agent:
                 self._replay_results = dict(pending.get("completed") or {})
                 response = pending["response"]
             else:
-                history = self.conversation.export_for(self.provider, special_format=custom_format_func)
+                history = self.conversation.export_for(self.provider, special_format=custom_format_func,
+                                                       model=self.model)
                 tools = self.tool_registry.export_for(self.provider, special_format=custom_format_func)
                 headers = {"Content-Type": "application/json"}
 
@@ -1445,7 +1794,7 @@ def test():
     # itself now, so this call only makes the demo's behaviour explicit.
     from .env import load_env
     load_env()
-    agent = Agent('gemini', 'gemini-3.5-flash')
+    agent = Agent('gemini')  # default model: Agent.default_model_for('gemini')
     while True:
         user_input = input("You: ")
         if user_input.lower() == "quit":
@@ -1460,7 +1809,7 @@ def test():
         response = agent.chat(user_input, thinking_visible=False, spinner=False)
         print(f"Agent: {response}")
     
-    agent = Agent('ollama', 'llama3')
+    agent = Agent('ollama')
     while True:
         user_input = input("You: ")
         if user_input.lower() == "quit":

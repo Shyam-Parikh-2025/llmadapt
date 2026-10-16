@@ -89,7 +89,11 @@ for provider, responses in PROVIDER_CASES.items():
     agent._send_request = FakeResponder(list(responses))
     assert agent.chat("go") == "done", provider
 
-    assert CALLED == [("alpha", "1"), ("beta", "2")], f"{provider}: {CALLED}"
+    # Tool calls in one turn run concurrently (Agent._run_tool_calls gathers
+    # them), so the order they *start* in is up to the scheduler - on Windows
+    # and Linux it differs. What must hold is that each ran exactly once, and
+    # (checked below) that results come back paired with the call that made them.
+    assert sorted(CALLED) == [("alpha", "1"), ("beta", "2")], f"{provider}: {CALLED}"
 
     tool_msgs = [m for m in agent.conversation.history if m.get("role") == "tool"]
     assert len(tool_msgs) == 2, f"{provider}: {len(tool_msgs)} tool messages"
@@ -98,7 +102,7 @@ for provider, responses in PROVIDER_CASES.items():
     assert tool_msgs[0]["content"] == "alpha:1", f"{provider}: {tool_msgs[0]}"
     assert tool_msgs[1]["content"] == "beta:2", f"{provider}: {tool_msgs[1]}"
     assert tool_msgs[0]["name"] == "alpha" and tool_msgs[1]["name"] == "beta", provider
-print("PASS: all four providers dispatch multi-call turns through the shared path, in order")
+print("PASS: all four providers dispatch multi-call turns through the shared path, results in call order")
 
 
 # --- 2. history keeps add_model_msg's normalized shape, not the dispatch one -
