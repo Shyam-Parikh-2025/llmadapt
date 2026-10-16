@@ -1,4 +1,17 @@
-from .core import Agent, Conversation, ToolRegistry, ToolControlFlow
+"""llmadapt - a small, provider-agnostic LLM agent library (Anthropic, OpenAI, Gemini, Ollama).
+
+Start here:
+
+    from llmadapt import Agent
+    agent = Agent("anthropic")            # or "openai", "gemini", "ollama"
+    print(agent.chat("Hello"))
+
+Run `llmadapt doctor` in a terminal to check what is configured.
+"""
+
+__version__ = "0.4.0"
+
+from .core import Agent, Conversation, ToolRegistry, ToolControlFlow, extract_json
 from .compressor import ContextCompressor, CompressionPolicy
 # `role` deliberately stops here - see router.py's docstring next to its
 # definition. Reach for it with `from llmadapt.router import role`, or use
@@ -27,7 +40,7 @@ from .builder import (
 )
 from .help import company_help
 from .delegation import (
-    stub_and_fill, plan_then_execute, stub_and_fill_async, plan_then_execute_async,
+    stub_and_fill, plan_then_execute, stub_and_fill_async, plan_then_execute_async, python_verifier,
     extract_stubs, assemble_module,
     StubPlan, StubAndFillResult, PlanResult,
 )
@@ -36,9 +49,22 @@ from .state import CompanyState, StateMismatch, capture_state, apply_state, STAT
 from .env import load_env, resolve_api_key, key_env_candidates
 from .compressor import PIN_KEY, HistoryCompactionPolicy
 from .suggest import did_you_mean
+from .toolkits import (
+    filesystem_tools, code_tools, shell_tools, python_tools, web_tools, toolkit, TOOLKITS, outline_source,
+)
 
 __all__ = [
+    "__version__",
     "Agent",
+    "extract_json",
+    "filesystem_tools",
+    "code_tools",
+    "shell_tools",
+    "python_tools",
+    "web_tools",
+    "toolkit",
+    "TOOLKITS",
+    "outline_source",
     "Conversation",
     "ToolRegistry",
     "ToolControlFlow",
@@ -101,6 +127,7 @@ __all__ = [
     "plan_then_execute",
     "stub_and_fill_async",
     "plan_then_execute_async",
+    "python_verifier",
     "extract_stubs",
     "assemble_module",
     "StubPlan",
@@ -121,4 +148,3 @@ __all__ = [
     "company_help",
     "register_company_builder",
 ]
-__version__ = "0.3.0"

@@ -30,9 +30,12 @@ employee to architect and the cheapest available ones to implement, and says so
 rather than pretending to be adaptive.
 
 What this does NOT do, stated plainly:
-- It does not execute or test the generated code. Assembly is checked with
-  `compile()` for syntax only; a stub whose body is confidently wrong will
-  assemble cleanly.
+- By default it does not execute or test the generated code. Assembly is
+  checked with `compile()` for syntax only; a stub whose body is confidently
+  wrong will assemble cleanly. Pass `verify=python_verifier(test_code)` (or any
+  callable) to run the assembled module plus your tests in a subprocess and
+  report failures on the result - opt-in, because it executes model-written
+  code on your machine.
 - It does not verify that an implementer honored the signature it was given.
   If the implementer renames the function, that stub is reported unfilled
   rather than silently mismatched, but a changed *parameter list* with the
@@ -45,9 +48,13 @@ What this does NOT do, stated plainly:
 import ast
 import asyncio
 import copy
+import os
 import re
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from .compressor import ContextCompressor
 from .core import run_coroutine_blocking
@@ -532,6 +539,10 @@ class StubAndFillResult:
     code: str = ""
     architect: Optional[str] = None
     syntax_error: Optional[str] = None
+    # Set only when stub_and_fill was given verify=: None means "passed" (or
+    # "not checked" - see `verified`), a string is what the verifier reported.
+    verify_error: Optional[str] = None
+    verified: bool = False
 
     @property
     def unfilled(self) -> List[str]:
@@ -549,13 +560,15 @@ class StubAndFillResult:
 
     @property
     def ok(self) -> bool:
-        return self.plan.ok and not self.unfilled and self.syntax_error is None
+        return (self.plan.ok and not self.unfilled and self.syntax_error is None
+                and self.verify_error is None)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "task": self.task, "architect": self.architect, "ok": self.ok,
             "stubs": [f.to_dict() for f in self.filled],
             "unfilled": self.unfilled, "syntax_error": self.syntax_error,
+            "verified": self.verified, "verify_error": self.verify_error,
             "parse_error": self.plan.parse_error,
             "architect_implemented": self.architect_implemented,
             "demoted": self.plan.demoted,
@@ -636,6 +649,7 @@ def stub_and_fill(
     architect_prompt: str = ARCHITECT_PROMPT,
     implementer_prompt: str = IMPLEMENTER_PROMPT,
     max_architect_body_lines: int = MAX_ARCHITECT_BODY_LINES,
+    verify: Optional[Callable[[str], Optional[str]]] = None,
 ) -> StubAndFillResult:
     """Synchronous wrapper over stub_and_fill_async(). See that for the docs."""
     return run_coroutine_blocking(
@@ -643,7 +657,7 @@ def stub_and_fill(
             company, task, architect=architect, implementers=implementers,
             max_stubs=max_stubs, architect_prompt=architect_prompt,
             implementer_prompt=implementer_prompt,
-            max_architect_body_lines=max_architect_body_lines),
+            max_architect_body_lines=max_architect_body_lines, verify=verify),
         what="stub_and_fill()",
     )
 
@@ -657,8 +671,16 @@ async def stub_and_fill_async(
     architect_prompt: str = ARCHITECT_PROMPT,
     implementer_prompt: str = IMPLEMENTER_PROMPT,
     max_architect_body_lines: int = MAX_ARCHITECT_BODY_LINES,
+    verify: Optional[Callable[[str], Optional[str]]] = None,
 ) -> StubAndFillResult:
     """Architect writes the interface; implementers fill the bodies.
+
+    `verify`, if given, is called with the assembled source once it compiles.
+    Return None (or "") for a pass, or a string describing the failure, which
+    lands on `result.verify_error` and makes `result.ok` false. Use
+    `python_verifier(test_code)` to import the module and run tests against
+    it in a subprocess. It runs off the event loop; an exception it raises is
+    reported, never propagated.
 
     Implementers are assigned round-robin over the pool - deliberately not
     "best implementer per stub", because ranking stubs by difficulty would
@@ -737,9 +759,55 @@ async def stub_and_fill_async(
         # Syntax only. Nothing here executes the module or checks that it does
         # what the docstrings promised - see the module docstring.
         result.syntax_error = str(e)
+    if verify is not None and result.syntax_error is None and not result.unfilled:
+        try:
+            outcome = await asyncio.to_thread(verify, result.code)
+        except Exception as e:  # noqa: BLE001 - a broken verifier is a result, not a crash
+            outcome = f"verifier raised {e.__class__.__name__}: {e}"
+        result.verified = True
+        result.verify_error = outcome or None
+        company._log("stub_verified", employee=architect.name, ok=result.verify_error is None,
+                     error=(result.verify_error or "")[:500])
     company._log("stub_assembled", employee=architect.name, ok=result.ok,
                  unfilled=result.unfilled, syntax_error=result.syntax_error)
     return result
+
+
+def python_verifier(test_code: str = "", timeout: float = 60.0,
+                    python: Optional[str] = None) -> Callable[[str], Optional[str]]:
+    """A `verify=` callable for stub_and_fill: runs the assembled module, then
+    `test_code` (plain asserts, or anything that exits non-zero on failure),
+    in a fresh interpreter (`python -I`) in a temporary directory.
+
+    Returns None when the script exits 0, else the tail of its output. With no
+    test_code it is an import check - catching NameErrors at module level,
+    missing imports and the like, which compile() cannot.
+
+    This executes code a model wrote. It is a subprocess in a temp directory,
+    not a sandbox: only use it where you would run that code yourself.
+    """
+    interpreter = python or sys.executable
+
+    def verify(code: str) -> Optional[str]:
+        with tempfile.TemporaryDirectory(prefix="llmadapt_verify_") as workdir:
+            path = os.path.join(workdir, "generated_module.py")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(code)
+                if test_code:
+                    f.write("\n\n# ---- verification ----\n")
+                    f.write(test_code)
+                    f.write("\n")
+            try:
+                proc = subprocess.run([interpreter, "-I", path], cwd=workdir, capture_output=True,
+                                      text=True, timeout=timeout, errors="replace")
+            except subprocess.TimeoutExpired:
+                return f"verification timed out after {timeout:g}s"
+        if proc.returncode == 0:
+            return None
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        return f"exit code {proc.returncode}:\n" + ContextCompressor.compress_tool_output(output, max_chars=3000)
+
+    return verify
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +972,7 @@ async def plan_then_execute_async(
 __all__ = [
     "Stub", "StubPlan", "FilledStub", "StubAndFillResult",
     "extract_code_block", "extract_stubs", "assemble_module", "stub_and_fill",
-    "stub_and_fill_async", "plan_then_execute_async",
+    "stub_and_fill_async", "plan_then_execute_async", "python_verifier",
     "PlanStep", "PlanResult", "parse_plan_steps", "plan_then_execute",
     "choose_architect", "choose_implementers",
     "DEFAULT_ARCHITECT_RANKS", "DEFAULT_IMPLEMENTER_RANKS",

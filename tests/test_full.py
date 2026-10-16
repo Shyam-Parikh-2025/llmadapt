@@ -42,11 +42,24 @@ print("PASS 1: anthropic parallel tool calls bundle correctly")
 
 
 # ---- 2. Default model fallback (NEW feature) ----
+import os as _os
+for _var in ("LLMADAPT_ANTHROPIC_MODEL", "LLMADAPT_GEMINI_MODEL"):
+    _os.environ.pop(_var, None)
 agent = Agent(provider="anthropic", api_key="k")  # no model given
-assert agent.model == "claude-3-5-sonnet-20241022", agent.model
+assert agent.model == Agent.DEFAULT_MODELS["anthropic"] == "claude-sonnet-5-5", agent.model
 agent2 = Agent(provider="gemini", api_key="k")
-assert agent2.model == "gemini-3.5-flash", agent2.model
+assert agent2.model == Agent.DEFAULT_MODELS["gemini"] == "gemini-3.6-flash", agent2.model
 print("PASS 2: default model fallback works per provider")
+
+# The defaults go stale as providers retire models, so each can be overridden
+# from the environment without touching code - and model= still beats both.
+_os.environ["LLMADAPT_ANTHROPIC_MODEL"] = "claude-haiku-5-5"
+try:
+    assert Agent(provider="anthropic", api_key="k").model == "claude-haiku-5-5"
+    assert Agent(provider="anthropic", api_key="k", model="explicit").model == "explicit"
+finally:
+    del _os.environ["LLMADAPT_ANTHROPIC_MODEL"]
+print("PASS 2b: LLMADAPT_<PROVIDER>_MODEL overrides the default, model= overrides that")
 
 
 # ---- 3. Tool exception -> string error, NOT a crash (NEW feature) ----
@@ -79,13 +92,15 @@ assert agent.max_tool_iterations == 6, agent.max_tool_iterations
 print("PASS 5: max_tool_iterations defaults to 6")
 
 
-# ---- 6. Anthropic max_tokens: explicit overrides default; default is 4096 ----
+# ---- 6. Anthropic max_tokens: explicit overrides default; default is 16000 ----
+# (Raised from 4096: current Claude models think before answering and thinking
+# counts toward max_tokens, so 4096 could be spent before any answer appeared.)
 agent = Agent(provider="anthropic", api_key="k")
 responder = FakeResponder([{"content": [{"type": "text", "text": "hi"}]}])
 agent._send_request = responder
 agent.chat("hello")
-assert responder.calls[0]["max_tokens"] == 4096
-print("PASS 6a: anthropic max_tokens defaults to 4096 when unset")
+assert responder.calls[0]["max_tokens"] == Agent.ANTHROPIC_DEFAULT_MAX_TOKENS == 16000
+print("PASS 6a: anthropic max_tokens defaults to 16000 when unset")
 
 agent2 = Agent(provider="anthropic", api_key="k", max_tokens=100)
 responder2 = FakeResponder([{"content": [{"type": "text", "text": "hi"}]}])

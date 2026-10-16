@@ -151,8 +151,14 @@ class Conversation:
             msg["tool_call_id"] = tool_call_id
         self._append(msg)
 
-    def export_for(self, provider: str, special_format: Callable[[list], list] = None) -> list:
-        """Translates local flat memory frames into target external API layouts."""
+    def export_for(self, provider: str, special_format: Callable[[list], list] = None,
+                   model: Optional[str] = None) -> list:
+        """Translates local flat memory frames into target external API layouts.
+
+        `model` is the model the request is about to go to. Only Anthropic
+        uses it: thinking blocks are tied to the model that produced them, so
+        replaying them to a different model (after switch_api) is rejected -
+        they are dropped from that model's view instead."""
         if special_format and callable(special_format):
             return special_format(self.history)
 
@@ -183,7 +189,7 @@ class Conversation:
             return cleaned_history
             
         elif provider == "anthropic":
-            return self._export_anthropic()
+            return self._export_anthropic(model=model)
             
         elif provider == "gemini":    
             return self._export_gemini()
@@ -202,7 +208,7 @@ class Conversation:
     def change_model_role(self, new_role: str):
         self.model_role = new_role
 
-    def _export_anthropic(self) -> list:
+    def _export_anthropic(self, model: Optional[str] = None) -> list:
         """Structures conversation blocks to comply with Anthropic context constraints."""
         out = []
         pending_tool_results = []
@@ -223,7 +229,13 @@ class Conversation:
                     continue
                 emitted_native_ids.add(native_hash)
                 flush()
-                out.append(msg["_native"])
+                native = msg["_native"]
+                produced_by = msg.get("_native_model")
+                if model and produced_by and produced_by != model and isinstance(native.get("content"), list):
+                    kept = [b for b in native["content"]
+                            if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))]
+                    native = dict(native, content=kept)
+                out.append(native)
                 continue
 
             if msg["role"] == "tool":
@@ -429,6 +441,210 @@ class RunPaused(ToolControlFlow):
         super().__init__(f"run paused awaiting a decision on: {getattr(event, 'message', event)!r}")
 
 
+def extract_json(text: str) -> Any:
+    """Parse the JSON value out of a model reply.
+
+    Tolerates the usual wrapping - a ```json fence, a sentence before or
+    after - by trying, in order: the whole text, the first fenced block, then
+    the first '{' or '[' decoded with raw_decode. Raises ValueError (with the
+    JSON error message) if none of them parse.
+    """
+    import re
+
+    if text is None:
+        raise ValueError("empty reply")
+    candidate = text.strip()
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        first_error = e
+    fence = re.search(r"```(?:json|JSON)?\s*\n?(.*?)```", candidate, re.DOTALL)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    decoder = json.JSONDecoder()
+    # Earliest opener first, so "[{...}, {...}]" comes back as the list rather
+    # than as its first element.
+    for start, char in enumerate(candidate):
+        if char not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(candidate[start:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    raise ValueError(str(first_error))
+
+
+def _add_anthropic_cache_breakpoints(payload: dict) -> None:
+    """Mark the stable prefix of an Anthropic request as cacheable: the
+    system prompt, the tool list, and the conversation so far (the last
+    message). Later requests that share that prefix are billed at the cache
+    read rate - most of a tool loop, or a long chat, re-sends exactly that.
+
+    Works on copies: history/tool dicts may be shared with the stored
+    conversation, which must never carry provider bookkeeping."""
+    marker = {"type": "ephemeral"}
+    system = payload.get("system")
+    if isinstance(system, str) and system:
+        payload["system"] = [{"type": "text", "text": system, "cache_control": marker}]
+    tools = payload.get("tools")
+    if tools:
+        payload["tools"] = list(tools[:-1]) + [dict(tools[-1], cache_control=marker)]
+    messages = payload.get("messages") or []
+    if messages:
+        last = dict(messages[-1])
+        content = last.get("content")
+        if isinstance(content, str) and content:
+            last["content"] = [{"type": "text", "text": content, "cache_control": marker}]
+        elif isinstance(content, list) and content and isinstance(content[-1], dict):
+            last["content"] = list(content[:-1]) + [dict(content[-1], cache_control=marker)]
+        payload["messages"] = list(messages[:-1]) + [last]
+
+
+def _merge_extra(payload: dict, extra: Optional[dict]) -> dict:
+    """Overlay `extra` onto a request body. Nested dicts merge one level
+    deep, so extra_params={"options": {"temperature": 0}} on Ollama keeps
+    the num_predict this library already put in "options"."""
+    if not extra:
+        return payload
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(payload.get(key), dict):
+            merged = dict(payload[key])
+            merged.update(value)
+            payload[key] = merged
+        else:
+            payload[key] = value
+    return payload
+
+
+def ollama_base_url() -> str:
+    """Where Ollama listens: OLLAMA_HOST if set (the variable Ollama itself
+    reads - "host:port", "0.0.0.0", or a full URL), else localhost:11434."""
+    import os
+    host = (os.environ.get("OLLAMA_HOST") or "").strip().rstrip("/")
+    if not host:
+        return "http://localhost:11434"
+    if "://" not in host:
+        host = "http://" + host
+    scheme, rest = host.split("://", 1)
+    hostname, _, port = rest.partition(":")
+    if hostname in ("0.0.0.0", ""):
+        hostname = "localhost"  # a bind-all address is not something to connect to
+    return f"{scheme}://{hostname}:{port or '11434'}"
+
+
+def _safe_print(text: str, **kwargs: Any) -> None:
+    """print() that cannot crash a run over an encoding. On Windows, stdout
+    piped into another process (exactly how a coding agent or CI captures
+    output) is often cp1252, where '➔' and the spinner glyphs raise
+    UnicodeEncodeError - inside Agent.chat(), for a status message."""
+    try:
+        print(text, **kwargs)
+    except UnicodeEncodeError:
+        ascii_text = text.replace("➔", "->").encode("ascii", errors="replace").decode("ascii")
+        print(ascii_text, **kwargs)
+
+
+def _stdout_is_tty(stream: Any = None) -> bool:
+    try:
+        import sys
+        stream = stream or sys.stdout
+        return bool(stream and stream.isatty())
+    except Exception:
+        return False
+
+
+_PRIMITIVE_JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+
+def _json_schema_for(annotation: Any) -> dict:
+    """A JSON-schema fragment for one parameter's type hint.
+
+    Deliberately forgiving: anything it does not recognise becomes
+    {"type": "string"}, which is what every parameter used to be. A tool
+    whose hints are exotic still registers; it just gets a looser schema.
+    """
+    import enum
+    import typing
+
+    if annotation in _PRIMITIVE_JSON_TYPES:
+        return {"type": _PRIMITIVE_JSON_TYPES[annotation]}
+    if annotation in (list, tuple, set, frozenset):
+        return {"type": "array"}
+    if annotation is dict:
+        return {"type": "object"}
+    if isinstance(annotation, type) and issubclass(annotation, enum.Enum):
+        values = [m.value for m in annotation]
+        out = _json_schema_for(type(values[0])) if values else {"type": "string"}
+        out["enum"] = values
+        return out
+
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin is typing.Union or type(annotation).__name__ == "UnionType":
+        non_none = [a for a in args if a is not type(None)]
+        # Optional[X] is just X to the model - whether it may be omitted is
+        # what "required" says, and that comes from the default value.
+        return _json_schema_for(non_none[0]) if len(non_none) == 1 else {"type": "string"}
+    if origin is typing.Literal:
+        values = list(args)
+        out = _json_schema_for(type(values[0])) if values else {"type": "string"}
+        out["enum"] = values
+        return out
+    if origin in (list, tuple, set, frozenset) or (
+        origin is not None and getattr(origin, "__name__", "") in ("Sequence", "Iterable", "Collection")
+    ):
+        out = {"type": "array"}
+        item_args = [a for a in args if a is not Ellipsis]
+        if len(set(item_args)) == 1:
+            out["items"] = _json_schema_for(item_args[0])
+        return out
+    if origin is dict or (origin is not None and getattr(origin, "__name__", "") == "Mapping"):
+        return {"type": "object"}
+    return {"type": "string"}
+
+
+def _param_docs_from_docstring(doc: str) -> dict:
+    """Per-parameter descriptions from a docstring's `Args:` section
+    (Google style) or `:param name:` lines (Sphinx style). Returns {} when
+    the docstring has neither - the caller keeps its generic fallback."""
+    import re
+
+    docs: dict = {}
+    for match in re.finditer(r"^\s*:param\s+(?:[\w\[\], .]+\s+)?(\w+)\s*:\s*(.+)$", doc, re.MULTILINE):
+        docs[match.group(1)] = match.group(2).strip()
+    if docs:
+        return docs
+
+    lines = doc.splitlines()
+    in_args = False
+    current = None
+    args_indent = None
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^(Args|Arguments|Parameters|Params)\s*:\s*$", stripped):
+            in_args, current, args_indent = True, None, None
+            continue
+        if not in_args:
+            continue
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip())
+        if re.match(r"^[A-Z][A-Za-z ]*:\s*$", stripped) and (args_indent is None or indent < args_indent):
+            break  # next section, e.g. "Returns:"
+        entry = re.match(r"^(\w+)\s*(?:\([^)]*\))?\s*:\s*(.*)$", stripped)
+        if entry and (args_indent is None or indent <= args_indent):
+            args_indent = indent if args_indent is None else args_indent
+            current = entry.group(1)
+            docs[current] = entry.group(2).strip()
+        elif current is not None:
+            docs[current] = (docs[current] + " " + stripped).strip()
+    return docs
+
+
 class ToolRegistry:
     """ Tool Registry Class:
     This class needs to handle tool storage and usage.
@@ -441,29 +657,43 @@ class ToolRegistry:
         self.schemas = {} 
     
     def register(self, python_function, schema: dict = None):
+        """Register a callable as a tool.
+
+        With no `schema`, one is generated from the function itself:
+
+        - the docstring becomes the tool description;
+        - each parameter's JSON type comes from its type hint - `str`, `int`,
+          `float`, `bool`, `list[...]`/`tuple`/`set`, `dict`, `Optional[X]`,
+          `Literal[...]` and `Enum` subclasses are understood; anything else
+          is sent as a string;
+        - a parameter's description is taken from a Google-style `Args:`
+          section or Sphinx `:param name:` lines when the docstring has one;
+        - parameters without a default are required.
+        """
         if schema is None:
             func_name = python_function.__name__
             func_doc = inspect.getdoc(python_function) or "No description available."
-            type_mapping = {
-                str: "string", int: "integer", float: "number", bool: "boolean"
-            }
 
-            type_hints = get_type_hints(python_function)
+            try:
+                type_hints = get_type_hints(python_function)
+            except Exception:
+                # Unresolvable forward references should cost precision in the
+                # schema, never the ability to register the tool at all.
+                type_hints = {}
             signature = inspect.signature(python_function)
+            param_docs = _param_docs_from_docstring(func_doc)
             properties = {}
             required_params = []
 
             for param_name, param in signature.parameters.items():
-                param_type = type_hints.get(param_name, str)
-                gemini_type = type_mapping.get(param_type, "string")
-
-                properties[param_name] = {
-                    "type": gemini_type,
-                    "description": f"The {param_name} parameter"
-                }
+                if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                    continue  # *args/**kwargs have no meaningful JSON-schema shape
+                prop = _json_schema_for(type_hints.get(param_name, str))
+                prop["description"] = param_docs.get(param_name) or f"The {param_name} parameter"
+                properties[param_name] = prop
                 if param.default == inspect.Parameter.empty:
                     required_params.append(param_name)
-            
+
             schema = {
                 "name": func_name,
                 "description": func_doc,
@@ -500,7 +730,25 @@ class ToolRegistry:
 
         if not isinstance(args, dict):
             return None, f"Error: Arguments for tool '{name}' must be passed as a dictionary."
-        return args, None
+        return self._coerce_enums(name, args), None
+
+    def _coerce_enums(self, name: str, args: dict) -> dict:
+        """A model can only send an Enum parameter's *value* (the schema
+        lists values); turn it back into the member the function declared."""
+        import enum
+        try:
+            hints = get_type_hints(self.functions_maps[name])
+        except Exception:
+            return args
+        out = dict(args)
+        for key, value in args.items():
+            hint = hints.get(key)
+            if isinstance(hint, type) and issubclass(hint, enum.Enum) and not isinstance(value, hint):
+                try:
+                    out[key] = hint(value)
+                except ValueError:
+                    pass  # leave it; the tool's own error is more specific
+        return out
 
     @staticmethod
     def _failure_text(e: BaseException) -> str:
@@ -597,12 +845,30 @@ class Agent:
     Add tool and send request to AI model functions are needed.
     An overall Chat function that handles sending the payload to the AI model and handles the response. """
     
+    # Used only when no model= is given. These go stale as providers retire
+    # models (the previous table pointed at claude-3-5-sonnet-20241022 and
+    # gpt-4o-mini, both retired or deprecated by late 2026), so each one can
+    # be overridden without a code change via LLMADAPT_<PROVIDER>_MODEL, e.g.
+    # LLMADAPT_ANTHROPIC_MODEL=claude-haiku-5-5. Passing model= always wins.
     DEFAULT_MODELS = {
-        "gemini": "gemini-3.5-flash",
-        "anthropic": "claude-3-5-sonnet-20241022",
-        "openai": "gpt-4o-mini",
+        "gemini": "gemini-3.6-flash",
+        "anthropic": "claude-sonnet-5-5",
+        "openai": "gpt-5.4-mini",
         "ollama": "llama3.1:8b"
     }
+
+    # Transient HTTP statuses worth retrying - the same set the official
+    # Anthropic and OpenAI SDKs retry: request timeout, conflict/lock, rate
+    # limit, and every 5xx (including Anthropic's 529 "overloaded").
+    RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+
+    @classmethod
+    def default_model_for(cls, provider: str) -> str:
+        """The model used when none is passed: `LLMADAPT_<PROVIDER>_MODEL`
+        from the environment (or a .env file) if set, else DEFAULT_MODELS."""
+        from .env import env_value
+        override = env_value(f"LLMADAPT_{provider.upper()}_MODEL")
+        return override or cls.DEFAULT_MODELS.get(provider, "custom-model")
 
     def __init__(self, provider: str, model: Optional[str] = None, base_url: Optional[str] = None,
                  api_key: Optional[str] = None, is_local: bool = False, system_instruction: str = "",
@@ -611,8 +877,46 @@ class Agent:
                  history_compaction: Optional[HistoryCompactionPolicy] = None,
                  archive: Optional[Any] = None,
                  key_alias: Optional[str] = None, key_env: Optional[str] = None,
-                 max_context_tokens: Optional[int] = None):
+                 max_context_tokens: Optional[int] = None,
+                 skills: Optional[list] = None, personality: Optional[Any] = None,
+                 tools: Optional[list] = None,
+                 verbose: Optional[bool] = None,
+                 request_timeout: Optional[float] = 600.0,
+                 max_retries: int = 2,
+                 extra_params: Optional[dict] = None,
+                 prompt_cache: bool = False):
+        """
+        Most callers need only `provider` (and `model`). The rest, briefly:
+
+        skills / personality: names from the built-in preset catalog
+            (`llmadapt.SKILLS.names()`, `llmadapt.PERSONALITIES.names()`) or
+            Skill/Personality objects. They are composed into the system
+            instruction, after `system_instruction`, exactly as
+            `Company.hire()` does it.
+        tools: callables (or a toolkit list from `llmadapt.toolkits`) to
+            register straight away - same as calling `add_tool` on each.
+        verbose: print stage messages and a spinner while working. None
+            (default) reads LLMADAPT_VERBOSE from the environment and falls
+            back to True; the spinner is only ever drawn on a real terminal.
+        request_timeout: seconds before an HTTP request is abandoned (None
+            waits forever, which is what every request did before).
+        max_retries: extra attempts for transient failures - 429, 5xx,
+            Anthropic's 529, dropped connections - with exponential backoff
+            that honours a Retry-After header.
+        extra_params: extra fields merged into every request body, for knobs
+            this library does not model itself - e.g. {"temperature": 0.2},
+            {"reasoning_effort": "low"} or Ollama {"options": {...}}.
+        prompt_cache: Anthropic only - mark the system prompt, tools and
+            conversation prefix as cacheable, so repeated requests (every step
+            of a tool loop, every turn of a chat) re-read them at ~10% of the
+            input price. The first write costs 25% extra, so it pays off from
+            the second request on. Other providers cache automatically.
+        """
         self.archive = archive
+        if skills or personality:
+            from .presets import compose_system_instruction
+            system_instruction = compose_system_instruction(
+                base=system_instruction, personality=personality, skills=skills or ())
         self.conversation = Conversation(system_instruction=system_instruction, archive=archive)
         self.tool_registry = ToolRegistry()
         self.change_api(provider=provider, model=model, base_url=base_url, api_key=api_key,
@@ -620,6 +924,23 @@ class Agent:
         self.set_max_tool_iterations(max_tool_iterations)
         self.max_tokens = max_tokens
         self.thinking_stage = "initial state"
+        if verbose is None:
+            from .env import env_value
+            flag = (env_value("LLMADAPT_VERBOSE") or "").strip().lower()
+            verbose = flag not in ("0", "false", "no", "off")
+        self.verbose = bool(verbose)
+        # Where stage messages and the spinner go. None means sys.stdout at
+        # print time; the CLI and MCP server point it at sys.stderr so stdout
+        # carries only the answer (or, for MCP, only the protocol).
+        self.status_stream = None
+        self.request_timeout = request_timeout
+        if not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError("max_retries must be a non-negative integer")
+        self.max_retries = max_retries
+        self.extra_params = dict(extra_params or {})
+        self.prompt_cache = bool(prompt_cache)
+        for tool_func in tools or ():
+            self.add_tool(tool_func)
 
         # A separate concept from max_tokens (the per-request *output* cap
         # sent to the provider): this is a whole-conversation budget tracked
@@ -758,7 +1079,16 @@ class Agent:
         try:
             if self.provider == "anthropic":
                 u = res.get("usage") or {}
-                return {"input": u.get("input_tokens", 0) or 0, "output": u.get("output_tokens", 0) or 0}
+                # With prompt caching, input_tokens counts only the uncached
+                # part; the cached prefix is reported separately. All of it was
+                # processed, so all of it counts toward budgets.
+                cache_write = u.get("cache_creation_input_tokens", 0) or 0
+                cache_read = u.get("cache_read_input_tokens", 0) or 0
+                out = {"input": (u.get("input_tokens", 0) or 0) + cache_write + cache_read,
+                       "output": u.get("output_tokens", 0) or 0}
+                if cache_write or cache_read:
+                    out.update({"cache_write": cache_write, "cache_read": cache_read})
+                return out
             if self.provider in ("openai", "custom"):
                 u = res.get("usage") or {}
                 return {"input": u.get("prompt_tokens", 0) or 0, "output": u.get("completion_tokens", 0) or 0}
@@ -775,10 +1105,56 @@ class Agent:
         usage = self._extract_usage(res)
         turn_total = usage["input"] + usage["output"]
         self.total_tokens_used += turn_total
-        self.usage_log.append({"input": usage["input"], "output": usage["output"], "total": turn_total})
+        entry = {"input": usage["input"], "output": usage["output"], "total": turn_total}
+        for key in ("cache_write", "cache_read"):
+            if usage.get(key):
+                entry[key] = usage[key]
+        entry["model"] = self.model
+        self.usage_log.append(entry)
 
-    def tool(self, python_function: Callable, schema: dict = None):
-        """Decorator to register a Python function as a tool with optional schema."""
+    def cost_estimate(self, catalog: Optional[Any] = None) -> Optional[float]:
+        """Rough USD cost of everything in usage_log, from the per-1K prices
+        in an ApiModelCatalog (the built-in seed table by default).
+
+        Local providers cost 0.0. Returns None if any call used a model the
+        catalog has no price for - an honest "unknown" beats a confident zero.
+        Cached input is priced at 10% (reads) and 125% (writes) of the input
+        rate, Anthropic's standard multipliers. An estimate for "roughly what
+        did that cost", not a bill: prices drift (see policy.py).
+        """
+        if self.provider == "ollama" or self.is_local:
+            return 0.0
+        if catalog is None:
+            from .policy import ApiModelCatalog
+            catalog = ApiModelCatalog()
+        total = 0.0
+        for entry in self.usage_log:
+            spec = catalog.find(entry.get("model", self.model)) if hasattr(catalog, "find") else None
+            if spec is None:
+                return None
+            cache_write = entry.get("cache_write", 0)
+            cache_read = entry.get("cache_read", 0)
+            plain_input = max(0, entry["input"] - cache_write - cache_read)
+            total += (plain_input * spec.cost_per_1k_input
+                      + cache_write * spec.cost_per_1k_input * 1.25
+                      + cache_read * spec.cost_per_1k_input * 0.10
+                      + entry["output"] * spec.cost_per_1k_output) / 1000.0
+        return round(total, 6)
+
+    def tool(self, python_function: Optional[Callable] = None, schema: dict = None):
+        """Decorator to register a Python function as a tool.
+
+        All three spellings work:
+
+            @agent.tool
+            def f(x: str): ...
+
+            @agent.tool()
+            def g(x: str): ...
+
+            @agent.tool(schema={...})
+            def h(x: str): ...
+        """
         if python_function is None:
             def decorator(func):
                 self.add_tool(func, schema)
@@ -792,9 +1168,11 @@ class Agent:
         self.thinking_stage = stage
         if not thinking_visible: return
         if detail:
-            print(f"[{self.provider.upper()}] ➔ {stage}: {detail}", end="\n", flush=True)
+            _safe_print(f"[{self.provider.upper()}] ➔ {stage}: {detail}", end="\n", flush=True,
+                        file=getattr(self, "status_stream", None))
         else:
-            print(f"[{self.provider.upper()}] ➔ {stage}...", end="\n", flush=True)
+            _safe_print(f"[{self.provider.upper()}] ➔ {stage}...", end="\n", flush=True,
+                        file=getattr(self, "status_stream", None))
 
     def pin_context(self, text: str, reason: str = "") -> dict:
         """Add a fact this agent must not lose to compaction. See
@@ -859,7 +1237,7 @@ class Agent:
         transport, and OPENAI_API_KEY is the wrong key for every one of them.
         """
         self.provider = provider.lower()
-        self.model = model or self.DEFAULT_MODELS.get(self.provider, "custom-model")
+        self.model = model or self.default_model_for(self.provider)
         self.api_key = api_key
         self.key_alias = key_alias
         self.key_env = key_env
@@ -873,7 +1251,7 @@ class Agent:
         elif self.provider == "anthropic":
             self.url = "https://api.anthropic.com/v1/messages"
         elif self.provider == "ollama":
-            self.url = "http://localhost:11434/api/chat"
+            self.url = ollama_base_url() + "/api/chat"
         else:
             self.url = ""
 
@@ -896,27 +1274,80 @@ class Agent:
                 logger.warning("Agent(provider=%r, model=%r): no API key - %s",
                                 self.provider, self.model, self.api_key_source)
 
+    def switch_api(self, provider: str, model: Optional[str] = None, base_url: Optional[str] = None,
+                   api_key: Optional[str] = None,
+                   key_alias: Optional[str] = None, key_env: Optional[str] = None) -> "Agent":
+        """Alias of change_api() (the name the README has always used), and
+        chainable. The conversation and the registered tools carry over."""
+        self.change_api(provider=provider, model=model, base_url=base_url, api_key=api_key,
+                        key_alias=key_alias, key_env=key_env)
+        return self
+
     def add_tool(self, python_function: Callable, schema: dict = None):
         self.tool_registry.register(python_function, schema)
 
+    def add_tools(self, functions) -> "Agent":
+        """Register several tools at once - e.g. a toolkit from
+        `llmadapt.toolkits` such as `filesystem_tools(".")`. Chainable."""
+        for func in functions:
+            self.add_tool(func)
+        return self
+
     def _send_request(self, payload: dict, headers: dict) -> dict:
-        """Executes native standard library post requests using zero external code."""
+        """POSTs one request with the standard library and returns the decoded
+        JSON body.
+
+        Transient failures (RETRYABLE_STATUS, dropped connections, timeouts)
+        are retried up to `max_retries` times with exponential backoff -
+        1s, 2s, 4s... capped at 30s, or the server's Retry-After when it sends
+        one. Anything else (401, 400, ...) fails immediately: retrying a bad
+        key or a malformed request only delays the same error.
+        """
         if not self.url:
             raise ValueError(f"API endpoint URL is not configured for provider '{self.provider}'. "
                              f"Please supply a valid base_url when calling change_api().")
 
         data_bytes = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(self.url, data=data_bytes, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"\n[{self.provider.upper()} HTTP Error {e.code}]: {e.read().decode('utf-8')}")
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"\n[Network Unreachable]: Check route {self.url}. Reason: {e.reason}")
+        attempts = getattr(self, "max_retries", 0) + 1
+        timeout = getattr(self, "request_timeout", None)
+        last_error: Optional[Exception] = None
+        for attempt in range(attempts):
+            req = urllib.request.Request(self.url, data=data_bytes, headers=headers, method="POST")
+            retry_after: Optional[float] = None
+            try:
+                if timeout is None:
+                    response_cm = urllib.request.urlopen(req)
+                else:
+                    response_cm = urllib.request.urlopen(req, timeout=timeout)
+                with response_cm as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                last_error = RuntimeError(f"\n[{self.provider.upper()} HTTP Error {e.code}]: {body}")
+                if e.code not in self.RETRYABLE_STATUS and e.code < 500:
+                    raise last_error
+                header = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    retry_after = float(header) if header else None
+                except ValueError:
+                    retry_after = None
+            except urllib.error.URLError as e:
+                last_error = RuntimeError(f"\n[Network Unreachable]: Check route {self.url}. Reason: {e.reason}")
+            except (TimeoutError, ConnectionError, OSError) as e:
+                last_error = RuntimeError(f"\n[Network Error]: {self.url}: {e.__class__.__name__}: {e}")
+            if attempt + 1 < attempts:
+                delay = retry_after if retry_after is not None else min(30.0, 2.0 ** attempt)
+                logger.warning("%s request failed (%s); retrying in %.1fs (attempt %d of %d)",
+                               self.provider, str(last_error).strip()[:200], delay, attempt + 2, attempts)
+                time.sleep(delay)
+        raise last_error  # type: ignore[misc]
 
     def chat(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
-             thinking_visible: bool = True, spinner: bool = True) -> str:
+             thinking_visible: Optional[bool] = None, spinner: bool = True) -> str:
         """The synchronous entry point, unchanged for every caller that isn't
         writing async code: hand it a string, get a string back, no event loop
         required anywhere in sight.
@@ -936,8 +1367,44 @@ class Agent:
             what="Agent.chat()",
         )
 
+    def chat_json(self, user_input: str, schema_hint: Optional[Any] = None, retries: int = 1,
+                  **chat_kwargs: Any) -> Any:
+        """Ask for a JSON answer and get it back parsed (dict, list, ...).
+
+        `schema_hint` - a JSON-schema dict, an example object, or plain prose -
+        is appended to the request so the model knows the shape you want.
+        If the reply does not parse, the model is shown the parse error and
+        asked again, up to `retries` more times; after that a ValueError is
+        raised carrying the last raw reply. Works with every provider because
+        it relies only on instructions and tolerant parsing (code fences and
+        leading chatter are stripped), not on a provider-specific JSON mode.
+        """
+        return run_coroutine_blocking(
+            lambda: self.chat_json_async(user_input, schema_hint=schema_hint, retries=retries, **chat_kwargs),
+            what="Agent.chat_json()",
+        )
+
+    async def chat_json_async(self, user_input: str, schema_hint: Optional[Any] = None, retries: int = 1,
+                              **chat_kwargs: Any) -> Any:
+        """The awaitable form of chat_json()."""
+        instruction = "Respond with only a single valid JSON value - no prose, no code fences."
+        if schema_hint is not None:
+            hint = schema_hint if isinstance(schema_hint, str) else json.dumps(schema_hint, indent=2)
+            instruction += f"\nThe JSON must match this shape:\n{hint}"
+        reply = await self.chat_async(f"{user_input}\n\n{instruction}", **chat_kwargs)
+        for attempt in range(retries + 1):
+            try:
+                return extract_json(reply)
+            except ValueError as e:
+                if attempt >= retries:
+                    raise ValueError(f"model did not return valid JSON after {retries + 1} attempt(s): {e}. "
+                                     f"Last reply: {reply[:500]!r}") from None
+                reply = await self.chat_async(
+                    f"That reply was not valid JSON ({e}). Reply again with only the JSON value.",
+                    **chat_kwargs)
+
     def generate(self, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
-                 thinking_visible: bool = True, spinner: bool = True) -> str:
+                 thinking_visible: Optional[bool] = None, spinner: bool = True) -> str:
         """Generate a response from the current conversation and tools.
 
         Synchronous wrapper over generate_async() - see chat() for why this
@@ -964,7 +1431,7 @@ class Agent:
 
         else:
             raise ValueError(f"Unsupported provider: {self.provider}. Please review how to configure custom providers.")
-        return payload
+        return _merge_extra(payload, getattr(self, "extra_params", None))
 
     def gen_payload_gemini(self, history, tools, headers, max_tokens: int):
         if self.api_key: headers["x-goog-api-key"] = self.api_key
@@ -976,12 +1443,19 @@ class Agent:
             payload["generationConfig"] = {"maxOutputTokens": max_tokens}
         return payload
     
+    # Anthropic requires max_tokens on every request. Current models think
+    # before answering by default and thinking counts toward this cap, so the
+    # old 4096 could be spent entirely on thinking, leaving an empty answer.
+    ANTHROPIC_DEFAULT_MAX_TOKENS = 16000
+
     def gen_payload_anthropic(self, history, tools, headers, max_tokens: int):
-        if max_tokens is None: max_tokens = 4096
+        if max_tokens is None: max_tokens = self.ANTHROPIC_DEFAULT_MAX_TOKENS
         headers.update({"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
         payload = {"model": self.model, "messages": history, "max_tokens": max_tokens}
         if tools: payload["tools"] = tools
         if self.conversation.system_instruction: payload["system"] = self.conversation.system_instruction
+        if getattr(self, "prompt_cache", False):
+            _add_anthropic_cache_breakpoints(payload)
         return payload
 
     def gen_payload_openai_custom(self, history, tools, headers, max_tokens: int):
@@ -1004,33 +1478,20 @@ class Agent:
         return payload
     
     # Helper method for processing completed responses
-    def _run_tool_calls(self, calls, thinking_visible=False) -> list:
-        """Runs one turn's tool calls and returns their finished output
-        strings, positionally aligned with `calls`.
+    async def _run_tool_calls(self, calls, thinking_visible=False) -> list:
+        """Runs a turn's tool calls concurrently and returns their outputs in
+        call order.
 
         `calls` is the provider-neutral shape every process_*_response method
         normalizes to before dispatching: a list of
         {"id": str|None, "name": str, "args": dict|str}. Each provider parses
         its own response into that shape and writes the results back in its
         own format; what happens in between - invoke, compress, keep the
-        stages narrated - is identical for all four, and this is now the only
+        stages narrated - is identical for all four, and this is the only
         place it is written.
 
-        It used to be written four times, once inside each process_*_response
-        method. That is the same duplication REVIEW_MODES had before it was
-        collapsed (see company/team.py), and it was about to get worse rather
-        than better: parallel tool execution and resumable escalations both
-        need to change exactly this step, and changing it in four places twice
-        over is how the four copies start disagreeing.
-
-        Deliberately sequential, exactly as before - this refactor is a
-        no-behaviour-change move, and turning the loop into an
-        `asyncio.gather` is the next phase's job, not this one's. It is a
-        separate method precisely so that becomes a one-place change.
-        """
-    async def _run_tool_calls(self, calls, thinking_visible=False) -> list:
-        """Runs a turn's tool calls concurrently and returns their outputs in
-        call order.
+        Because the calls run concurrently, the order in which the tools
+        *start* is not guaranteed - only the order of the returned results is.
 
         This is the line that makes a delegation hierarchy worth having. A
         manager splitting work three ways emits three tool calls in one turn;
@@ -1191,6 +1652,7 @@ class Agent:
                 text=final_text if final_text else None, tool_calls=t_calls,
                 native={"role": "assistant", "content": res.get("content", [])}, native_provider="anthropic"
             )
+            self.conversation.history[-1]["_native_model"] = self.model
             calls = [{"id": tc["id"], "name": tc["function"]["name"], "args": tc["function"]["arguments"]}
                      for tc in t_calls]
             outputs = await self._run_tool_calls(calls, thinking_visible=thinking_visible)
@@ -1208,6 +1670,11 @@ class Agent:
             self._update_stage("Tool results sent to AI", thinking_visible=thinking_visible)
             return None
         
+        if not final_text and res.get("stop_reason") == "max_tokens":
+            raise RuntimeError(
+                f"{self.model} used its whole max_tokens ({res.get('usage', {}).get('output_tokens', '?')} "
+                f"output tokens) before writing an answer - usually on thinking. Raise max_tokens "
+                f"(Agent(max_tokens=...) or chat(..., max_tokens=...)).")
         self.conversation.add_model_msg(text=final_text)
         self._update_stage("Success", thinking_visible=thinking_visible)
         return final_text
@@ -1247,6 +1714,10 @@ class Agent:
             return None
         
         text = msg.get("content", "")
+        if not text and res['choices'][0].get("finish_reason") == "length":
+            raise RuntimeError(
+                f"{self.model} hit its token limit before writing an answer (finish_reason=length) - "
+                f"raise max_tokens.")
         self.conversation.add_model_msg(text=text)
         self._update_stage("Success", thinking_visible=thinking_visible)
         return text    
@@ -1336,15 +1807,16 @@ class Agent:
         try:
             while True:
                 if thinking_visible:
-                    print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="", flush=True)
+                    _safe_print(f"\r[{self.provider.upper()}] ➔ Thinking {spinner_frames[spinner_idx]} ", end="",
+                                flush=True, file=getattr(self, "status_stream", None))
                     spinner_idx = (spinner_idx + 1) % len(spinner_frames)
                 await asyncio.sleep(0.08)  # Relinquishes control cleanly to event loop
         except asyncio.CancelledError:
             # Clear spinner line cleanly when the network task completes
-            print("\r" + " " * 50 + "\r", end="", flush=True)
+            _safe_print("\r" + " " * 50 + "\r", end="", flush=True, file=getattr(self, "status_stream", None))
 
     async def chat_async(self, user_input: str, custom_format_func: Callable[[list], list] = None, max_tokens: int = None,
-                 thinking_visible: bool = True, spinner: bool = True) -> str:
+                 thinking_visible: Optional[bool] = None, spinner: bool = True) -> str:
             # Resuming a paused run re-enters this agent through exactly the
             # call that paused it, carrying the same task text. The turn it was
             # in the middle of is still recorded, so this is a continuation, not
@@ -1358,9 +1830,14 @@ class Agent:
     
     async def generate_async(
         self, custom_format_func: Callable[[list], list] = None, 
-        max_tokens: int = None, thinking_visible: bool = True, 
+        max_tokens: int = None, thinking_visible: Optional[bool] = None,
         spinner: bool = True) -> str:
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        if thinking_visible is None:
+            thinking_visible = getattr(self, "verbose", True)
+        # A spinner redraws one line with "\r"; in a log file, a pipe, or the
+        # captured output of a coding agent's shell that is just noise.
+        spinner = bool(spinner and thinking_visible and _stdout_is_tty(getattr(self, "status_stream", None)))
         # Off the loop: in mode="agent" this makes a full summarizer round-trip,
         # and doing that inline would stall every other coroutine sharing the loop
         # for the length of an LLM call.
@@ -1385,7 +1862,8 @@ class Agent:
                 self._replay_results = dict(pending.get("completed") or {})
                 response = pending["response"]
             else:
-                history = self.conversation.export_for(self.provider, special_format=custom_format_func)
+                history = self.conversation.export_for(self.provider, special_format=custom_format_func,
+                                                       model=self.model)
                 tools = self.tool_registry.export_for(self.provider, special_format=custom_format_func)
                 headers = {"Content-Type": "application/json"}
 
@@ -1445,7 +1923,7 @@ def test():
     # itself now, so this call only makes the demo's behaviour explicit.
     from .env import load_env
     load_env()
-    agent = Agent('gemini', 'gemini-3.5-flash')
+    agent = Agent('gemini')  # default model: Agent.default_model_for('gemini')
     while True:
         user_input = input("You: ")
         if user_input.lower() == "quit":
@@ -1460,7 +1938,7 @@ def test():
         response = agent.chat(user_input, thinking_visible=False, spinner=False)
         print(f"Agent: {response}")
     
-    agent = Agent('ollama', 'llama3')
+    agent = Agent('ollama')
     while True:
         user_input = input("You: ")
         if user_input.lower() == "quit":

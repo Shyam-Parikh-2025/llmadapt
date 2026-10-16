@@ -411,7 +411,7 @@ function renderEditor() {
 
   const modelInput = document.createElement("input");
   modelInput.value = emp.model || "";
-  modelInput.placeholder = "e.g. claude-3-5-sonnet-20241022";
+  modelInput.placeholder = "e.g. claude-sonnet-5-5";
   modelInput.onchange = () => { emp.model = modelInput.value.trim() || null; };
   field("Model override", modelInput);
 

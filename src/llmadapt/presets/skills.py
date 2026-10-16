@@ -402,6 +402,169 @@ BUILTIN_SKILLS: Tuple[Skill, ...] = (
         constraints=("Do not silently smooth over a phrase you could not translate faithfully - flag it.",),
         specialty="writing",
     ),
+    # --- Coding-assistant built-ins ------------------------------------------
+    # The everyday jobs a coding agent is handed. Several pair naturally with a
+    # toolkit (llmadapt.toolkits): "agentic-coding" is written for an agent
+    # that holds fs-write/shell tools, "code-explanation" for one holding
+    # fs/code. Skills still only *instruct*; the toolkit is what acts.
+    Skill(
+        name="agentic-coding",
+        description="Works on a real codebase through tools: look first, change small, verify after.",
+        instructions=(
+            "Before changing a file, read it (or outline it) and find where the change belongs - "
+            "never edit from memory. Make the smallest change that does the job, one concern at a "
+            "time. After changing code, run the tests or the command that proves it works, and "
+            "report exactly what you ran and what it printed. If you could not verify something, "
+            "say so instead of implying you did."
+        ),
+        constraints=(
+            "Do not claim code works unless you ran something that showed it working.",
+            "Do not delete or overwrite a file you have not read in this task.",
+        ),
+        specialty="code",
+        effort="balanced",
+    ),
+    Skill(
+        name="code-explanation",
+        description="Explains what code does and why, pointing at the lines that matter.",
+        instructions=(
+            "Start with what the code is for in one or two sentences, then walk the main path a "
+            "call takes through it. Cite file and line for each claim. Separate what the code "
+            "does from what its names or comments say it does, and point out where they differ."
+        ),
+        constraints=("Do not describe behaviour you inferred from a name without checking the body.",),
+        specialty="code",
+    ),
+    Skill(
+        name="test-driven-development",
+        description="Writes the failing test first, then the least code that passes it.",
+        instructions=(
+            "Write a test that captures the requirement and show that it fails for the right "
+            "reason. Then write the least code that makes it pass, and refactor only with the "
+            "tests green. Repeat in small steps; each step should leave the suite passing."
+        ),
+        constraints=("Do not write implementation code before a test exists that needs it.",),
+        specialty="code",
+    ),
+    Skill(
+        name="error-handling",
+        description="Makes failures loud, specific and recoverable at the right layer.",
+        instructions=(
+            "Validate input at trust boundaries and fail early with a message that names what was "
+            "wrong and how to fix it. Catch only exceptions you can handle; let the rest "
+            "propagate with context added. Clean up resources on every path, and decide "
+            "deliberately which errors are retried and which are surfaced."
+        ),
+        constraints=(
+            "Do not swallow an exception silently or with a bare except.",
+            "Do not put secrets or full user data into an error message or log line.",
+        ),
+        specialty="code",
+    ),
+    Skill(
+        name="concurrency",
+        description="Writes concurrent code that is correct under every interleaving, not just the usual one.",
+        instructions=(
+            "Name every piece of shared mutable state and what protects it. Prefer message passing "
+            "or immutable data over locks, and give every wait a timeout and a cancellation path. "
+            "Reason about the worst interleaving, not the likely one, and say which ordering "
+            "guarantees the code relies on."
+        ),
+        constraints=("Do not fix a race with a sleep.",),
+        specialty="code",
+        effort="balanced",
+    ),
+    Skill(
+        name="dependency-management",
+        description="Adds, upgrades and removes dependencies deliberately.",
+        instructions=(
+            "Before adding a dependency, say what it replaces and what it costs: size, maintenance, "
+            "license, and the transitive packages it brings. Pin versions the way the project "
+            "already does, update the lockfile with the tool that owns it, and read the changelog "
+            "for every major version you cross."
+        ),
+        constraints=(
+            "Do not add a dependency for something the standard library already does well.",
+            "Do not upgrade across a major version without listing its breaking changes.",
+        ),
+        specialty="code",
+    ),
+    Skill(
+        name="code-migration",
+        description="Moves code to a new API, version or framework in safe, reversible steps.",
+        instructions=(
+            "Inventory every call site first. Migrate in steps that each leave the build and tests "
+            "green, using a compatibility shim or adapter where both worlds must coexist. Keep "
+            "behaviour identical unless a change is explicitly asked for, and finish by removing "
+            "the shim and the old path."
+        ),
+        constraints=("Do not combine a migration with unrelated cleanups in the same step.",),
+        specialty="code",
+        effort="balanced",
+    ),
+    Skill(
+        name="git-workflow",
+        description="Keeps history clean, reviewable and safe to share.",
+        instructions=(
+            "Make small commits that each do one thing and leave the tree working. Write commit "
+            "messages as an imperative summary line plus a body that says why. Work on a branch, "
+            "check `git status` and `git diff` before committing, and keep generated files and "
+            "secrets out of the repository."
+        ),
+        constraints=(
+            "Do not force-push or rewrite history that others may have pulled.",
+            "Do not commit credentials, .env files or large binaries.",
+        ),
+        specialty="code",
+    ),
+    Skill(
+        name="shell-scripting",
+        description="Writes shell scripts that are safe to run twice and on a bad day.",
+        instructions=(
+            "Say which shell you target (bash, POSIX sh or PowerShell). In bash, start with "
+            "`set -euo pipefail`, quote every expansion, and use arrays for argument lists. Make "
+            "scripts idempotent, check preconditions up front, and print what is about to change "
+            "before changing it."
+        ),
+        constraints=(
+            "Do not pipe a download straight into a shell.",
+            "Do not use rm -rf on a path built from a variable without checking the variable first.",
+        ),
+        specialty="code",
+    ),
+    Skill(
+        name="typescript",
+        description="Writes TypeScript whose types actually protect the caller.",
+        instructions=(
+            "Write strict TypeScript: model the data with precise types and discriminated unions, "
+            "narrow unknown input at the boundary, and let inference work inside functions. "
+            "Export types for public APIs and keep runtime validation and static types in step."
+        ),
+        constraints=("Do not use `any` or a non-null assertion to silence an error you have not understood.",),
+        specialty="code",
+    ),
+    Skill(
+        name="go",
+        description="Writes plain, idiomatic Go.",
+        instructions=(
+            "Write idiomatic Go: small interfaces defined by the consumer, errors returned and "
+            "wrapped with context (fmt.Errorf with %w), context.Context as the first parameter "
+            "for anything that blocks, and gofmt-clean code. Prefer the standard library."
+        ),
+        constraints=("Do not ignore a returned error with `_` unless you say why it is safe.",),
+        specialty="code",
+    ),
+    Skill(
+        name="rust",
+        description="Writes safe, idiomatic Rust that the borrow checker and reviewers both accept.",
+        instructions=(
+            "Write idiomatic Rust: model states with enums, return Result with a meaningful error "
+            "type, borrow rather than clone unless ownership is really needed, and keep `unsafe` "
+            "out unless there is no alternative - then document the invariant it relies on."
+        ),
+        constraints=("Do not call unwrap() or expect() on a value that can fail at runtime outside tests.",),
+        specialty="code",
+    ),
 )
 
 SKILLS = PresetRegistry("skill", Skill, BUILTIN_SKILLS)

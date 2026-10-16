@@ -1,5 +1,35 @@
 # llmadapt — handoff context (post Phase 0-8)
 
+> **Update, v0.4.0 (October 2026).** A readiness pass landed on top of
+> everything below. Repo conventions for AI contributors now live in the root
+> `CLAUDE.md`; this file stays as history. Summary of 0.4.0:
+>
+> - **Fixes:** `test_tool_dispatch` asserted start order of concurrently
+>   dispatched tools (failed every run); `test_selector` hung on Windows
+>   (64GB of `truncate()`d files) and is re-enabled with patched sizes;
+>   importing `__main__` used to exit the test process. README's `switch_api`
+>   now exists. Stale default models replaced and made env-overridable.
+> - **Core:** HTTP timeout + retries (SDK-equivalent statuses, Retry-After),
+>   `skills=`/`personality=`/`tools=` on `Agent`, `extra_params`,
+>   `prompt_cache` (Anthropic), `cost_estimate()`, `chat_json()`,
+>   richer tool schemas (Literal/Enum/list/Optional, `Args:` docs), verbose
+>   flag + `status_stream`, encoding-safe status output, `OLLAMA_HOST`,
+>   `GOOGLE_API_KEY`, Anthropic max_tokens default 16000 and an error (not
+>   `""`) when a reply is truncated before answering.
+> - **New modules:** `toolkits.py` (fs, fs-write, code, shell, python, web),
+>   `cli.py` (`llmadapt doctor/ask/map/chat/outline/stub/compress/list/mcp`),
+>   `mcp_server.py` (stdio MCP server), 12 new coding skills (39 total).
+> - **Suite:** 27 files, 550+ checks, green on Python 3.9-3.13 (Linux);
+>   CI workflow added for Linux/macOS/Windows.
+>
+> - **Delegation:** `stub_and_fill(verify=python_verifier(tests))` runs the
+>   assembled module + tests in a subprocess (roadmap item #2, first half).
+>
+> Still open, in order of value: (1) a repair round when verification fails
+> (feed the failure back to the implementers); (2) OpenAI Responses API
+> transport (GPT-6 models only support tools there); (3) streaming, which
+> unlocks mid-generation budget enforcement; (4) budget governance v2.
+
 Companion to `company-roadmap.md`. The roadmap is the authoritative record of
 *what was built and why*, per phase. This document covers everything around
 that: conventions, decisions that shouldn't be re-opened, the file map, and how

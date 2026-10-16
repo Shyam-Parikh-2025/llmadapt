@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 # Files that live in tests/ but are not automated tests.
-SKIP = {"run_all.py", "test_trial_own.py", "test_selector.py"}
+SKIP = {"run_all.py", "test_trial_own.py"}
 
 
 def discover():

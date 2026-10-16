@@ -151,7 +151,7 @@ class Company:
             "mode": "local"|"api"|"auto", "effort": ..., "specialty": ...,
             "cost_per_1k": ..., "alias": ..., "key_env": ...}.
             This is how a per-rank default model is set - {C_SUITE: {"provider":
-            "anthropic", "model": "claude-opus-4-6"}, JUNIOR: {"provider":
+            "anthropic", "model": "claude-opus-5-5"}, JUNIOR: {"provider":
             "ollama", "model": "llama3.1:8b"}} - and hire() overrides any of it
             for one employee.
             "api_key" is optional and usually better left out: with no key, the

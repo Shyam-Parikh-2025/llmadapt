@@ -26,10 +26,31 @@ def make_benchmark(gpu_vram_gb, system_ram_gb, cpu_gflops=100.0, pcie_bandwidth_
     )
 
 
+# The selector only ever learns a model's size through os.path.getsize. This
+# test used to create real multi-GB files with f.truncate() - free on Linux
+# (sparse files) but on Windows/NTFS it allocated ~64GB across the fake models
+# and hung, which is why run_all.py had to skip the whole file. Now every
+# "weights" file is a few bytes on disk and its pretend size is served from
+# FAKE_SIZES by a patched getsize, so the test is instant on every OS.
+FAKE_SIZES = {}
+_real_getsize = os.path.getsize
+
+
+def _fake_getsize(path):
+    key = os.path.normcase(os.path.abspath(path))
+    if key in FAKE_SIZES:
+        return FAKE_SIZES[key]
+    return _real_getsize(path)
+
+
+os.path.getsize = _fake_getsize
+
+
 def touch_sized_file(path, size_bytes):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
-        f.truncate(size_bytes)
+        f.write(b"x")
+    FAKE_SIZES[os.path.normcase(os.path.abspath(path))] = size_bytes
 
 
 root = tempfile.mkdtemp(prefix="llmadapt_selector_test_")

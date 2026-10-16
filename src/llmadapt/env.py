@@ -214,6 +214,10 @@ def key_env_candidates(provider: Optional[str] = None, alias: Optional[str] = No
         names.append(f"{_normalize(alias)}_API_KEY")
     if provider:
         names.append(f"{_normalize(provider)}_API_KEY")
+        # Google's own SDKs and docs use GOOGLE_API_KEY for the same Gemini
+        # key, so a user following them has set that one, not ours.
+        if _normalize(provider) == "GEMINI":
+            names.append("GOOGLE_API_KEY")
     seen = set()
     return [n for n in names if not (n in seen or seen.add(n))]
 
